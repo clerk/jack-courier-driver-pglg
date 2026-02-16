@@ -1,0 +1,197 @@
+package pglg
+
+import (
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/jackc/pglogrepl"
+	courier "github.com/clerk/jack-courier-lib"
+)
+
+// WAL message types used as internal representations after parsing.
+
+type walRelation struct {
+	id      uint32
+	name    string
+	columns []string
+}
+
+type walInsert struct {
+	relationID uint32
+	values     []columnValue
+}
+
+type columnValue struct {
+	isNull bool
+	data   string
+}
+
+type walCommit struct {
+	commitLSN lsn
+}
+
+type walStreamStart struct{}
+type walStreamStop struct{}
+
+type walStreamCommit struct {
+	commitLSN lsn
+}
+
+type walStreamAbort struct{}
+
+// parseWALMessage parses a raw pgoutput v2 WAL message into an internal type.
+func parseWALMessage(walData []byte, inStream bool) (any, error) {
+	msg, err := pglogrepl.ParseV2(walData, inStream)
+	if err != nil {
+		return nil, fmt.Errorf("pglg: parse WAL message: %w", err)
+	}
+
+	switch m := msg.(type) {
+	case *pglogrepl.RelationMessageV2:
+		cols := make([]string, len(m.Columns))
+		for i, c := range m.Columns {
+			cols[i] = c.Name
+		}
+		return &walRelation{id: m.RelationID, name: m.RelationName, columns: cols}, nil
+
+	case *pglogrepl.RelationMessage:
+		cols := make([]string, len(m.Columns))
+		for i, c := range m.Columns {
+			cols[i] = c.Name
+		}
+		return &walRelation{id: m.RelationID, name: m.RelationName, columns: cols}, nil
+
+	case *pglogrepl.InsertMessageV2:
+		vals := make([]columnValue, len(m.Tuple.Columns))
+		for i, col := range m.Tuple.Columns {
+			vals[i] = columnValue{
+				isNull: col.DataType == pglogrepl.TupleDataTypeNull,
+				data:   string(col.Data),
+			}
+		}
+		return &walInsert{relationID: m.RelationID, values: vals}, nil
+
+	case *pglogrepl.CommitMessage:
+		return &walCommit{commitLSN: m.TransactionEndLSN}, nil
+
+	case *pglogrepl.BeginMessage:
+		return nil, nil // no-op, we don't need begin markers
+
+	case *pglogrepl.StreamStartMessageV2:
+		return &walStreamStart{}, nil
+
+	case *pglogrepl.StreamStopMessageV2:
+		return &walStreamStop{}, nil
+
+	case *pglogrepl.StreamCommitMessageV2:
+		return &walStreamCommit{commitLSN: m.TransactionEndLSN}, nil
+
+	case *pglogrepl.StreamAbortMessageV2:
+		return &walStreamAbort{}, nil
+
+	default:
+		return nil, nil // ignore unhandled message types
+	}
+}
+
+// parsedInsert holds fields extracted from an outbox row INSERT.
+type parsedInsert struct {
+	id         int64
+	producerID string
+	jobType    string
+	payload    []byte
+	runAt      time.Time
+	traceID    string
+}
+
+// toJob converts a parsedInsert to a courier.Job.
+func (p *parsedInsert) toJob() courier.Job {
+	return courier.Job{
+		CorrelationID: strconv.FormatInt(p.id, 10),
+		ProducerID:    p.producerID,
+		JobType:       p.jobType,
+		Payload:       p.payload,
+		RunAt:         p.runAt,
+		TraceID:       p.traceID,
+	}
+}
+
+// parseInsertColumns extracts outbox fields from column names and values.
+func parseInsertColumns(columns []string, values []columnValue) (*parsedInsert, error) {
+	if len(columns) != len(values) {
+		return nil, fmt.Errorf("pglg: column count %d != value count %d", len(columns), len(values))
+	}
+
+	row := &parsedInsert{}
+	for i, colName := range columns {
+		v := values[i]
+		if v.isNull {
+			continue
+		}
+
+		switch colName {
+		case "id":
+			n, err := strconv.ParseInt(v.data, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("pglg: parse id: %w", err)
+			}
+			row.id = n
+		case "producer_id":
+			row.producerID = v.data
+		case "job_type":
+			row.jobType = v.data
+		case "payload":
+			row.payload = decodeBytea(v.data)
+		case "run_at":
+			t, err := parseTimestamp(v.data)
+			if err != nil {
+				return nil, fmt.Errorf("pglg: parse run_at: %w", err)
+			}
+			row.runAt = t
+		case "trace_id":
+			row.traceID = v.data
+		}
+	}
+
+	return row, nil
+}
+
+// decodeBytea decodes a pgoutput bytea text representation.
+// pgoutput sends bytea values as raw bytes in the tuple data.
+func decodeBytea(s string) []byte {
+	return []byte(s)
+}
+
+// parseTimestamp parses a Postgres timestamp string.
+func parseTimestamp(s string) (time.Time, error) {
+	// Try common Postgres timestamp formats.
+	formats := []string{
+		"2006-01-02 15:04:05.999999+00",
+		"2006-01-02 15:04:05.999999-07",
+		"2006-01-02 15:04:05.999999Z",
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05+00",
+		"2006-01-02 15:04:05-07",
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("pglg: unrecognized timestamp format: %q", s)
+}
+
+// txBuffer accumulates parsed inserts within a single WAL transaction.
+type txBuffer struct {
+	inserts []parsedInsert
+}
+
+func (tb *txBuffer) reset() {
+	tb.inserts = tb.inserts[:0]
+}
+
+func (tb *txBuffer) addInsert(p parsedInsert) {
+	tb.inserts = append(tb.inserts, p)
+}
