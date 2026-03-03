@@ -6,20 +6,20 @@ A [jack-courier-lib](https://github.com/clerk/jack-courier-lib) driver that uses
 
 ```
 ┌─────────────────┐    INSERT (same tx)     ┌──────────────────┐
-│  Domain Service  │ ────────────────────►  │  Outbox Table     │
-│  (business logic)│                         │  (partitioned)    │
+│  Domain Service │ ────────────────────►   │  Outbox Table    │
+│ (business logic)│                         │  (partitioned)   │
 └─────────────────┘                         └────────┬─────────┘
                                                      │ WAL stream
                                                      ▼
                                             ┌──────────────────┐
-                                            │  pglg Driver      │
-                                            │  (this library)   │
+                                            │  pglg Driver     │
+                                            │  (this library)  │
                                             └────────┬─────────┘
                                                      │ submit([]Job)
                                                      ▼
                                             ┌──────────────────┐
-                                            │  jack-service     │
-                                            │  (gRPC)           │
+                                            │  jack-service    │
+                                            │  (gRPC)          │
                                             └──────────────────┘
 ```
 
