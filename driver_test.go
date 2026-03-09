@@ -49,6 +49,9 @@ func TestConfigSetDefaults(t *testing.T) {
 	if cfg.Logger == nil {
 		t.Error("expected non-nil Logger")
 	}
+	if cfg.Statsd == nil {
+		t.Error("expected non-nil Statsd")
+	}
 }
 
 func TestConfigSetDefaults_PreservesExisting(t *testing.T) {

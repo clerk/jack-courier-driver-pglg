@@ -28,9 +28,11 @@ func (d *Driver) partitionMaintenance(ctx context.Context) {
 
 func (d *Driver) runPartitionMaintenance(ctx context.Context) {
 	if err := d.createPartitions(ctx); err != nil {
+		_ = d.cfg.Statsd.Incr("jack.courier.partition.error", []string{"op:create"}, 1)
 		d.cfg.Logger.Error("partition creation failed", slog.String("error", err.Error()))
 	}
 	if err := d.dropExpiredPartitions(ctx); err != nil {
+		_ = d.cfg.Statsd.Incr("jack.courier.partition.error", []string{"op:drop"}, 1)
 		d.cfg.Logger.Error("partition cleanup failed", slog.String("error", err.Error()))
 	}
 }
@@ -91,6 +93,7 @@ func (d *Driver) createPartitions(ctx context.Context) error {
 			return fmt.Errorf("pglg: commit partition %s: %w", partName, err)
 		}
 
+		_ = d.cfg.Statsd.Incr("jack.courier.partition.created", nil, 1)
 		d.cfg.Logger.Info("partition created",
 			slog.String("name", partName),
 			slog.Time("lower", lower),
@@ -154,6 +157,7 @@ func (d *Driver) dropExpiredPartitions(ctx context.Context) error {
 			return fmt.Errorf("pglg: delete meta %s: %w", name, err)
 		}
 
+		_ = d.cfg.Statsd.Incr("jack.courier.partition.dropped", nil, 1)
 		d.cfg.Logger.Info("partition dropped", slog.String("name", name))
 	}
 

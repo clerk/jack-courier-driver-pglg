@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/DataDog/datadog-go/v5/statsd"
 	courier "github.com/clerk/jack-courier-lib"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -64,6 +65,9 @@ type Config struct {
 
 	// Logger is the structured logger. Default: slog.Default().
 	Logger *slog.Logger
+
+	// Statsd is the DogStatsD client for metrics. Default: no-op client.
+	Statsd statsd.ClientInterface
 }
 
 func (c *Config) setDefaults() {
@@ -102,6 +106,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
+	}
+	if c.Statsd == nil {
+		c.Statsd = &statsd.NoOpClient{}
 	}
 }
 
@@ -212,6 +219,7 @@ func (d *Driver) Run(ctx context.Context, submit courier.SubmitFunc) error {
 			return ctx.Err()
 		}
 
+		_ = d.cfg.Statsd.Incr("jack.courier.wal.reconnect", nil, 1)
 		d.cfg.Logger.Error("WAL stream error, will reconnect",
 			slog.String("error", err.Error()))
 
@@ -366,8 +374,12 @@ func (d *Driver) flushBatch(
 		slog.Int("count", len(jobs)),
 		slog.String("commit_lsn", commitLSN.String()))
 
+	_ = d.cfg.Statsd.Distribution("jack.courier.flush.batch_size", float64(len(jobs)), nil, 1)
+
+	flushStart := time.Now()
 	results, err := submit(ctx, jobs)
 	if err != nil {
+		_ = d.cfg.Statsd.Incr("jack.courier.flush.count", []string{"status:error"}, 1)
 		return fmt.Errorf("pglg: submit failed: %w", err)
 	}
 
@@ -390,6 +402,12 @@ func (d *Driver) flushBatch(
 	if err := wal.sendStandbyStatus(ctx); err != nil {
 		d.cfg.Logger.Warn("failed to send standby status after flush",
 			slog.String("error", err.Error()))
+	}
+
+	_ = d.cfg.Statsd.Incr("jack.courier.flush.count", []string{"status:success"}, 1)
+	_ = d.cfg.Statsd.Distribution("jack.courier.flush.duration", time.Since(flushStart).Seconds(), nil, 1)
+	if failCount > 0 {
+		_ = d.cfg.Statsd.Distribution("jack.courier.flush.failed_jobs", float64(failCount), nil, 1)
 	}
 
 	d.cfg.Logger.Info("batch submitted",
