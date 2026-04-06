@@ -1,10 +1,10 @@
 module github.com/clerk/jack-courier-driver-pglg
 
-go 1.25.6
+go 1.25.0
 
 require (
 	github.com/DataDog/datadog-go/v5 v5.8.3
-	github.com/clerk/jack-courier-lib v0.1.0
+	github.com/clerk/jack-courier-lib v1.0.1
 	github.com/jackc/pglogrepl v0.0.0-20250509230407-a9884f6bd75a
 	github.com/jackc/pgx/v5 v5.7.6
 )
