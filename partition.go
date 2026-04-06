@@ -27,6 +27,8 @@ func (d *Driver) partitionMaintenance(ctx context.Context) {
 }
 
 func (d *Driver) runPartitionMaintenance(ctx context.Context) {
+	start := time.Now()
+
 	if err := d.createPartitions(ctx); err != nil {
 		_ = d.cfg.Statsd.Incr("jack.courier.partition.error", []string{"op:create"}, 1)
 		d.cfg.Logger.Error("partition creation failed", slog.String("error", err.Error()))
@@ -35,6 +37,10 @@ func (d *Driver) runPartitionMaintenance(ctx context.Context) {
 		_ = d.cfg.Statsd.Incr("jack.courier.partition.error", []string{"op:drop"}, 1)
 		d.cfg.Logger.Error("partition cleanup failed", slog.String("error", err.Error()))
 	}
+
+	_ = d.cfg.Statsd.Distribution("jack.courier.partition.maintenance.duration", time.Since(start).Seconds(), nil, 1)
+
+	d.emitPartitionMetrics(ctx)
 }
 
 // createPartitions ensures partitions exist from (now - 1*interval) to (now + lookAhead).
@@ -162,6 +168,59 @@ func (d *Driver) dropExpiredPartitions(ctx context.Context) error {
 	}
 
 	return tx.Commit(ctx)
+}
+
+// emitPartitionMetrics queries partition_meta and emits gauge metrics for
+// operational visibility into partition health.
+func (d *Driver) emitPartitionMetrics(ctx context.Context) {
+	metaTable := d.cfg.partitionMetaTable()
+	now := time.Now().UTC()
+
+	// Total partition count.
+	var count int
+	err := d.pool.QueryRow(ctx,
+		fmt.Sprintf("SELECT COUNT(*) FROM %s", metaTable),
+	).Scan(&count)
+	if err != nil {
+		d.cfg.Logger.Warn("failed to query partition count", slog.String("error", err.Error()))
+		return
+	}
+	_ = d.cfg.Statsd.Gauge("jack.courier.partition.total_count", float64(count), nil, 1)
+
+	if count == 0 {
+		_ = d.cfg.Statsd.Gauge("jack.courier.partition.lookahead_hours", 0, nil, 1)
+		_ = d.cfg.Statsd.Gauge("jack.courier.partition.oldest_hours", 0, nil, 1)
+		return
+	}
+
+	// Furthest upper_bound — how far ahead we have coverage.
+	var maxUpper time.Time
+	err = d.pool.QueryRow(ctx,
+		fmt.Sprintf("SELECT MAX(upper_bound) FROM %s", metaTable),
+	).Scan(&maxUpper)
+	if err != nil {
+		d.cfg.Logger.Warn("failed to query max upper_bound", slog.String("error", err.Error()))
+		return
+	}
+	lookaheadHours := maxUpper.Sub(now).Hours()
+	_ = d.cfg.Statsd.Gauge("jack.courier.partition.lookahead_hours", lookaheadHours, nil, 1)
+
+	// Oldest lower_bound — how old the oldest partition is.
+	var minLower time.Time
+	err = d.pool.QueryRow(ctx,
+		fmt.Sprintf("SELECT MIN(lower_bound) FROM %s", metaTable),
+	).Scan(&minLower)
+	if err != nil {
+		d.cfg.Logger.Warn("failed to query min lower_bound", slog.String("error", err.Error()))
+		return
+	}
+	oldestHours := now.Sub(minLower).Hours()
+	_ = d.cfg.Statsd.Gauge("jack.courier.partition.oldest_hours", oldestHours, nil, 1)
+
+	d.cfg.Logger.Debug("partition metrics emitted",
+		slog.Int("total_count", count),
+		slog.Float64("lookahead_hours", lookaheadHours),
+		slog.Float64("oldest_hours", oldestHours))
 }
 
 // partitionName generates a deterministic partition name from a lower-bound timestamp.
