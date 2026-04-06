@@ -79,7 +79,66 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  destroy  Drop outbox tables, publication, and replication slot")
 }
 
+// checkPrivileges verifies the connected user has the necessary privileges
+// to create tables, publications, and replication slots.
+func checkPrivileges(ctx context.Context, conn *pgx.Conn, schema string) error {
+	var user string
+	if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&user); err != nil {
+		return fmt.Errorf("get current user: %w", err)
+	}
+	fmt.Printf("connected as user: %s\n", user)
+
+	var missing []string
+
+	// Check REPLICATION role attribute (needed for replication slot).
+	var hasReplication bool
+	err := conn.QueryRow(ctx,
+		"SELECT rolreplication FROM pg_roles WHERE rolname = current_user",
+	).Scan(&hasReplication)
+	if err != nil {
+		return fmt.Errorf("check replication role: %w", err)
+	}
+	if !hasReplication {
+		missing = append(missing, "REPLICATION role (required to create replication slots)")
+	}
+
+	// Check CREATE privilege on schema (needed for tables).
+	var hasSchemaCreate bool
+	err = conn.QueryRow(ctx,
+		"SELECT has_schema_privilege(current_user, $1, 'CREATE')", schema,
+	).Scan(&hasSchemaCreate)
+	if err != nil {
+		return fmt.Errorf("check schema privilege: %w", err)
+	}
+	if !hasSchemaCreate {
+		missing = append(missing, fmt.Sprintf("CREATE on schema %q (required to create tables)", schema))
+	}
+
+	// Check CREATE privilege on database (needed for publications).
+	var hasDBCreate bool
+	err = conn.QueryRow(ctx,
+		"SELECT has_database_privilege(current_user, current_database(), 'CREATE')",
+	).Scan(&hasDBCreate)
+	if err != nil {
+		return fmt.Errorf("check database privilege: %w", err)
+	}
+	if !hasDBCreate {
+		missing = append(missing, "CREATE on database (required to create publications)")
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("user %q is missing required privileges:\n  - %s", user, strings.Join(missing, "\n  - "))
+	}
+
+	fmt.Println("privilege check passed")
+	return nil
+}
+
 func runCreate(ctx context.Context, conn *pgx.Conn, schema, prefix, publication, slot string) error {
+	if err := checkPrivileges(ctx, conn, schema); err != nil {
+		return err
+	}
+
 	replacer := strings.NewReplacer(
 		"{schema}", schema,
 		"{prefix}", prefix,
