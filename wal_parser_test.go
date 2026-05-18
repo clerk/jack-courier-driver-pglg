@@ -42,6 +42,44 @@ func TestParseInsertColumns(t *testing.T) {
 	}
 }
 
+func TestParseInsertColumns_Shadow(t *testing.T) {
+	cases := []struct {
+		name string
+		val  string
+		want bool
+	}{
+		{"true", "t", true},
+		{"false", "f", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			columns := []string{"id", "producer_id", "job_type", "shadow"}
+			values := []columnValue{{data: "1"}, {data: "svc"}, {data: "t"}, {data: tc.val}}
+
+			row, err := parseInsertColumns(columns, values)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if row.shadow != tc.want {
+				t.Errorf("shadow=%v, want %v", row.shadow, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseInsertColumns_ShadowDefaultsFalseWhenAbsent(t *testing.T) {
+	columns := []string{"id", "producer_id", "job_type"}
+	values := []columnValue{{data: "1"}, {data: "svc"}, {data: "t"}}
+
+	row, err := parseInsertColumns(columns, values)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if row.shadow {
+		t.Errorf("shadow should default to false when column absent, got true")
+	}
+}
+
 func TestParseInsertColumns_NullRunAt(t *testing.T) {
 	columns := []string{"id", "producer_id", "job_type", "payload", "run_at", "trace_id"}
 	values := []columnValue{
@@ -82,10 +120,14 @@ func TestParsedInsertToJob(t *testing.T) {
 		payload:    []byte(`{"to":"user@example.com"}`),
 		runAt:      runAt,
 		traceID:    "trace-xyz",
+		shadow:     true,
 	}
 
 	job := p.toJob()
 
+	if !job.Shadow {
+		t.Errorf("expected Shadow=true on courier.Job, got false")
+	}
 	if job.CorrelationID != "99" {
 		t.Errorf("expected CorrelationID=99, got %s", job.CorrelationID)
 	}

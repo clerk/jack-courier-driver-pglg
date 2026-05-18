@@ -6,5 +6,6 @@ CREATE TABLE IF NOT EXISTS {schema}.{prefix}_jobs (
     payload     BYTEA       NOT NULL DEFAULT '',
     run_at      TIMESTAMPTZ,
     trace_id    TEXT        NOT NULL DEFAULT '',
+    shadow      BOOLEAN     NOT NULL DEFAULT false,
     PRIMARY KEY (created_at, id)
 ) PARTITION BY RANGE (created_at);
