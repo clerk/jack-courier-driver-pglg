@@ -103,6 +103,7 @@ type parsedInsert struct {
 	payload    []byte
 	runAt      time.Time
 	traceID    string
+	shadow     bool
 }
 
 // toJob converts a parsedInsert to a courier.Job.
@@ -114,6 +115,7 @@ func (p *parsedInsert) toJob() courier.Job {
 		Payload:       p.payload,
 		RunAt:         p.runAt,
 		TraceID:       p.traceID,
+		Shadow:        p.shadow,
 	}
 }
 
@@ -151,6 +153,8 @@ func parseInsertColumns(columns []string, values []columnValue) (*parsedInsert, 
 			row.runAt = t
 		case "trace_id":
 			row.traceID = v.data
+		case "shadow":
+			row.shadow = v.data == "t"
 		}
 	}
 
