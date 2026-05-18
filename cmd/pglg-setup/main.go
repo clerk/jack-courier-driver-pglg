@@ -35,6 +35,7 @@ func main() {
 	prefix := flags.String("prefix", "outbox", "Table name prefix")
 	publication := flags.String("publication", "", "Publication name (required)")
 	slot := flags.String("slot", "", "Replication slot name (required)")
+	skipPublication := flags.Bool("skip-publication", false, "Skip publication creation (and the CREATE-on-database privilege check); use when the publication is managed by a more-privileged role")
 	flags.Parse(os.Args[2:])
 
 	if *connString == "" || *publication == "" || *slot == "" {
@@ -55,7 +56,7 @@ func main() {
 
 	switch cmd {
 	case "create":
-		if err := runCreate(ctx, conn, *schema, *prefix, *publication, *slot); err != nil {
+		if err := runCreate(ctx, conn, *schema, *prefix, *publication, *slot, *skipPublication); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -80,8 +81,9 @@ func usage() {
 }
 
 // checkPrivileges verifies the connected user has the necessary privileges
-// to create tables, publications, and replication slots.
-func checkPrivileges(ctx context.Context, conn *pgx.Conn, schema string) error {
+// to create tables, publications, and replication slots. When
+// skipPublication is true, the CREATE-on-database check is omitted.
+func checkPrivileges(ctx context.Context, conn *pgx.Conn, schema string, skipPublication bool) error {
 	var user string
 	if err := conn.QueryRow(ctx, "SELECT current_user").Scan(&user); err != nil {
 		return fmt.Errorf("get current user: %w", err)
@@ -115,15 +117,17 @@ func checkPrivileges(ctx context.Context, conn *pgx.Conn, schema string) error {
 	}
 
 	// Check CREATE privilege on database (needed for publications).
-	var hasDBCreate bool
-	err = conn.QueryRow(ctx,
-		"SELECT has_database_privilege(current_user, current_database(), 'CREATE')",
-	).Scan(&hasDBCreate)
-	if err != nil {
-		return fmt.Errorf("check database privilege: %w", err)
-	}
-	if !hasDBCreate {
-		missing = append(missing, "CREATE on database (required to create publications)")
+	if !skipPublication {
+		var hasDBCreate bool
+		err = conn.QueryRow(ctx,
+			"SELECT has_database_privilege(current_user, current_database(), 'CREATE')",
+		).Scan(&hasDBCreate)
+		if err != nil {
+			return fmt.Errorf("check database privilege: %w", err)
+		}
+		if !hasDBCreate {
+			missing = append(missing, "CREATE on database (required to create publications)")
+		}
 	}
 
 	if len(missing) > 0 {
@@ -134,8 +138,8 @@ func checkPrivileges(ctx context.Context, conn *pgx.Conn, schema string) error {
 	return nil
 }
 
-func runCreate(ctx context.Context, conn *pgx.Conn, schema, prefix, publication, slot string) error {
-	if err := checkPrivileges(ctx, conn, schema); err != nil {
+func runCreate(ctx context.Context, conn *pgx.Conn, schema, prefix, publication, slot string, skipPublication bool) error {
+	if err := checkPrivileges(ctx, conn, schema, skipPublication); err != nil {
 		return err
 	}
 
@@ -153,6 +157,10 @@ func runCreate(ctx context.Context, conn *pgx.Conn, schema, prefix, publication,
 	}
 
 	for _, f := range files {
+		if skipPublication && strings.Contains(f.name, "create_publication") {
+			fmt.Printf("skipping %s (--skip-publication set)\n", f.name)
+			continue
+		}
 		sql := replacer.Replace(f.content)
 		fmt.Printf("executing %s...\n", f.name)
 		if _, err := conn.Exec(ctx, sql); err != nil {
