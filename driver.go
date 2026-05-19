@@ -313,6 +313,7 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 			}
 		case *walCommit:
 			for i := range buf.inserts {
+				d.recordRowAge(&buf.inserts[i])
 				pendingJobs = append(pendingJobs, buf.inserts[i].toJob())
 			}
 			if ev.commitLSN > pendingCommitLSN {
@@ -333,6 +334,7 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 			inStream = false
 		case *walStreamCommit:
 			for i := range buf.inserts {
+				d.recordRowAge(&buf.inserts[i])
 				pendingJobs = append(pendingJobs, buf.inserts[i].toJob())
 			}
 			if ev.commitLSN > pendingCommitLSN {
@@ -356,6 +358,19 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		default:
 		}
 	}
+}
+
+// recordRowAge emits the time-since-row-creation as a distribution so
+// operators can see how stale rows are when the courier picks them up.
+// Approximates CDC lag without a separate WAL-position poll: if the
+// courier keeps up, age tracks the courier's batch interval; if it
+// falls behind, age grows.
+func (d *Driver) recordRowAge(p *parsedInsert) {
+	if p.createdAt.IsZero() {
+		return
+	}
+	_ = d.cfg.Statsd.Distribution("jack.courier.row.age", time.Since(p.createdAt).Seconds(),
+		[]string{"job_type:" + p.jobType}, 1)
 }
 
 // flushBatch submits a batch of jobs and advances the cursor on success.
