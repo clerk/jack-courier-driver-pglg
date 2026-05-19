@@ -98,6 +98,7 @@ func parseWALMessage(walData []byte, inStream bool) (any, error) {
 // parsedInsert holds fields extracted from an outbox row INSERT.
 type parsedInsert struct {
 	id         int64
+	createdAt  time.Time
 	producerID string
 	jobType    string
 	payload    []byte
@@ -139,6 +140,12 @@ func parseInsertColumns(columns []string, values []columnValue) (*parsedInsert, 
 				return nil, fmt.Errorf("pglg: parse id: %w", err)
 			}
 			row.id = n
+		case "created_at":
+			t, err := parseTimestamp(v.data)
+			if err != nil {
+				return nil, fmt.Errorf("pglg: parse created_at: %w", err)
+			}
+			row.createdAt = t
 		case "producer_id":
 			row.producerID = v.data
 		case "job_type":
