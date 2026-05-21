@@ -1,6 +1,7 @@
 package pglg
 
 import (
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"time"
@@ -151,7 +152,11 @@ func parseInsertColumns(columns []string, values []columnValue) (*parsedInsert, 
 		case "job_type":
 			row.jobType = v.data
 		case "payload":
-			row.payload = decodeBytea(v.data)
+			b, err := decodeBytea(v.data)
+			if err != nil {
+				return nil, fmt.Errorf("pglg: decode payload: %w", err)
+			}
+			row.payload = b
 		case "run_at":
 			t, err := parseTimestamp(v.data)
 			if err != nil {
@@ -168,10 +173,13 @@ func parseInsertColumns(columns []string, values []columnValue) (*parsedInsert, 
 	return row, nil
 }
 
-// decodeBytea decodes a pgoutput bytea text representation.
-// pgoutput sends bytea values as raw bytes in the tuple data.
-func decodeBytea(s string) []byte {
-	return []byte(s)
+// decodeBytea decodes pgoutput's text-mode BYTEA wire form: "\x" + hex.
+// Inputs without the "\x" prefix pass through unchanged.
+func decodeBytea(s string) ([]byte, error) {
+	if len(s) >= 2 && s[0] == '\\' && s[1] == 'x' {
+		return hex.DecodeString(s[2:])
+	}
+	return []byte(s), nil
 }
 
 // parseTimestamp parses a Postgres timestamp string.

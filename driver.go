@@ -305,7 +305,8 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		case *walInsert:
 			job, parseErr := wal.parseInsert(ev)
 			if parseErr != nil {
-				d.cfg.Logger.Warn("failed to parse INSERT", slog.String("error", parseErr.Error()))
+				_ = d.cfg.Statsd.Incr("jack.courier.parse.error", nil, 1)
+				d.cfg.Logger.Error("failed to parse INSERT, row dropped", slog.String("error", parseErr.Error()))
 				continue
 			}
 			if job != nil {
