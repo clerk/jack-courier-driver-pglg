@@ -1,9 +1,14 @@
 package pglg
 
 import (
+	"encoding/hex"
 	"testing"
 	"time"
 )
+
+func toBytea(s string) string {
+	return `\x` + hex.EncodeToString([]byte(s))
+}
 
 func TestParseInsertColumns(t *testing.T) {
 	columns := []string{"id", "created_at", "producer_id", "job_type", "payload", "run_at", "trace_id"}
@@ -12,7 +17,7 @@ func TestParseInsertColumns(t *testing.T) {
 		{data: "2026-02-16 14:30:00.123456+00"},
 		{data: "billing-service"},
 		{data: "charge_customer"},
-		{data: `{"amount":100}`},
+		{data: toBytea(`{"amount":100}`)},
 		{data: "2026-02-16 15:00:00+00"},
 		{data: "trace-abc-123"},
 	}
@@ -86,7 +91,7 @@ func TestParseInsertColumns_NullRunAt(t *testing.T) {
 		{data: "1"},
 		{data: "svc"},
 		{data: "do_thing"},
-		{data: "{}"},
+		{data: toBytea(`{}`)},
 		{isNull: true},
 		{data: ""},
 	}
