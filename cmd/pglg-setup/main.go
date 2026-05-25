@@ -47,14 +47,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	if cmd != "create" {
+		if *replica {
+			fmt.Fprintf(os.Stderr, "error: --replica is only supported for 'create' (got %q)\n", cmd)
+			os.Exit(1)
+		}
+		if *createPartitionsFrom != "" {
+			fmt.Fprintf(os.Stderr, "error: --create-partitions is only supported for 'create' (got %q)\n", cmd)
+			os.Exit(1)
+		}
+	}
+
 	if *createPartitionsFrom != "" && !*replica {
 		fmt.Fprintln(os.Stderr, "error: --create-partitions requires --replica")
 		flags.Usage()
 		os.Exit(1)
 	}
 
-	if !*replica && (*publication == "" || *slot == "") {
-		fmt.Fprintln(os.Stderr, "error: --publication and --slot are required (unless --replica)")
+	pubSlotRequired := cmd != "create" || !*replica
+	if pubSlotRequired && (*publication == "" || *slot == "") {
+		if cmd == "create" {
+			fmt.Fprintln(os.Stderr, "error: --publication and --slot are required (unless --replica)")
+		} else {
+			fmt.Fprintln(os.Stderr, "error: --publication and --slot are required")
+		}
 		flags.Usage()
 		os.Exit(1)
 	}
