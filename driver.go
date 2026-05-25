@@ -68,6 +68,16 @@ type Config struct {
 
 	// Statsd is the DogStatsD client for metrics. Default: no-op client.
 	Statsd statsd.ClientInterface
+
+	// Replicas configures logical replicas that should receive mirrored
+	// partition CREATE/DROP DDL. Empty means no replication. Default: empty.
+	Replicas []ReplicaConfig
+}
+
+type ReplicaConfig struct {
+	Name             string
+	ConnString       string
+	SubscriptionName string
 }
 
 func (c *Config) setDefaults() {
@@ -122,6 +132,24 @@ func (c *Config) validate() error {
 	if c.PublicationName == "" {
 		return fmt.Errorf("pglg: PublicationName is required")
 	}
+
+	seen := make(map[string]bool, len(c.Replicas))
+	for i, r := range c.Replicas {
+		if r.Name == "" {
+			return fmt.Errorf("pglg: Replicas[%d]: Name is required", i)
+		}
+		if r.ConnString == "" {
+			return fmt.Errorf("pglg: Replicas[%d] (%q): ConnString is required", i, r.Name)
+		}
+		if r.SubscriptionName == "" {
+			return fmt.Errorf("pglg: Replicas[%d] (%q): SubscriptionName is required", i, r.Name)
+		}
+		if seen[r.Name] {
+			return fmt.Errorf("pglg: duplicate replica name %q", r.Name)
+		}
+		seen[r.Name] = true
+	}
+
 	return nil
 }
 
@@ -173,13 +201,28 @@ func ConfigFromEnv() (Config, error) {
 		cfg.StandbyInterval = d
 	}
 
+	if dsn := os.Getenv("PGLG_REPLICA_CONN_STRING"); dsn != "" {
+		cfg.Replicas = append(cfg.Replicas, ReplicaConfig{
+			Name:             os.Getenv("PGLG_REPLICA_NAME"),
+			ConnString:       dsn,
+			SubscriptionName: os.Getenv("PGLG_REPLICA_SUBSCRIPTION"),
+		})
+	}
+
 	return cfg, nil
 }
 
 // Driver implements courier.Driver using PostgreSQL logical replication.
 type Driver struct {
-	cfg  Config
-	pool *pgxpool.Pool
+	cfg          Config
+	pool         *pgxpool.Pool
+	replicaPools []replicaPool
+}
+
+type replicaPool struct {
+	name             string
+	pool             *pgxpool.Pool
+	subscriptionName string
 }
 
 // New creates a new pglg Driver.
@@ -196,13 +239,32 @@ func New(cfg Config) (*Driver, error) {
 		return nil, fmt.Errorf("pglg: create pool: %w", err)
 	}
 
-	return &Driver{cfg: cfg, pool: pool}, nil
+	replicaPools := make([]replicaPool, 0, len(cfg.Replicas))
+	for _, r := range cfg.Replicas {
+		rp, err := pgxpool.New(context.Background(), r.ConnString)
+		if err != nil {
+			for _, prev := range replicaPools {
+				prev.pool.Close()
+			}
+			pool.Close()
+			return nil, fmt.Errorf("pglg: create replica pool %q: %w", r.Name, err)
+		}
+
+		replicaPools = append(replicaPools, replicaPool{name: r.Name, pool: rp, subscriptionName: r.SubscriptionName})
+	}
+
+	return &Driver{cfg: cfg, pool: pool, replicaPools: replicaPools}, nil
 }
 
 // Run implements courier.Driver. It blocks until ctx is cancelled or an
 // unrecoverable error occurs.
 func (d *Driver) Run(ctx context.Context, submit courier.SubmitFunc) error {
-	defer d.pool.Close()
+	defer func() {
+		d.pool.Close()
+		for _, r := range d.replicaPools {
+			r.pool.Close()
+		}
+	}()
 
 	// Start partition maintenance goroutine.
 	go d.partitionMaintenance(ctx)
@@ -255,10 +317,10 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 
 	// 4. Receive loop.
 	var (
-		buf             txBuffer
-		pendingJobs     []courier.Job
+		buf              txBuffer
+		pendingJobs      []courier.Job
 		pendingCommitLSN = startLSN
-		inStream        bool
+		inStream         bool
 	)
 
 	batchTimer := time.NewTimer(d.cfg.BatchTimeout)
