@@ -2,10 +2,13 @@ package pglg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
@@ -63,6 +66,14 @@ type Config struct {
 	// ReconnectMaxDelay is the maximum reconnection delay. Default: 30s.
 	ReconnectMaxDelay time.Duration
 
+	// SlotBusyRetryDelay is the base delay between retries when the replication
+	// slot is held by another consumer (active-passive leader election). Default: 5s.
+	SlotBusyRetryDelay time.Duration
+
+	// SlotBusyRetryJitter is the +/- jitter applied to SlotBusyRetryDelay
+	// to avoid thundering herd on simultaneous standby retries. Default: 1s.
+	SlotBusyRetryJitter time.Duration
+
 	// Logger is the structured logger. Default: slog.Default().
 	Logger *slog.Logger
 
@@ -113,6 +124,12 @@ func (c *Config) setDefaults() {
 	}
 	if c.ReconnectMaxDelay <= 0 {
 		c.ReconnectMaxDelay = 30 * time.Second
+	}
+	if c.SlotBusyRetryDelay <= 0 {
+		c.SlotBusyRetryDelay = 5 * time.Second
+	}
+	if c.SlotBusyRetryJitter <= 0 {
+		c.SlotBusyRetryJitter = 1 * time.Second
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -217,6 +234,21 @@ type Driver struct {
 	cfg          Config
 	pool         *pgxpool.Pool
 	replicaPools []replicaPool
+
+	isLeader atomic.Bool
+
+	maintWake chan struct{}
+
+	standbyLogged bool
+}
+
+// Role returns the current role of this driver instance: "leader" or "standby".
+func (d *Driver) Role() string {
+	if d.isLeader.Load() {
+		return "leader"
+	}
+
+	return "standby"
 }
 
 type replicaPool struct {
@@ -253,7 +285,12 @@ func New(cfg Config) (*Driver, error) {
 		replicaPools = append(replicaPools, replicaPool{name: r.Name, pool: rp, subscriptionName: r.SubscriptionName})
 	}
 
-	return &Driver{cfg: cfg, pool: pool, replicaPools: replicaPools}, nil
+	return &Driver{
+		cfg:          cfg,
+		pool:         pool,
+		replicaPools: replicaPools,
+		maintWake:    make(chan struct{}, 1),
+	}, nil
 }
 
 // Run implements courier.Driver. It blocks until ctx is cancelled or an
@@ -278,7 +315,26 @@ func (d *Driver) Run(ctx context.Context, submit courier.SubmitFunc) error {
 	for {
 		err := d.runOnce(ctx, submit)
 		if err == nil || ctx.Err() != nil {
+			d.relinquishLeadership("shutdown")
 			return ctx.Err()
+		}
+
+		if errors.Is(err, errSlotBusy) {
+			d.relinquishLeadership("slot_busy")
+			if !d.standbyLogged {
+				d.cfg.Logger.Info("standby - slot held by another consumer",
+					slog.String("slot", d.cfg.SlotName))
+				d.standbyLogged = true
+			}
+			jitter := time.Duration(rand.Int64N(int64(2*d.cfg.SlotBusyRetryJitter+1))) - d.cfg.SlotBusyRetryJitter
+			t := time.NewTimer(d.cfg.SlotBusyRetryDelay + jitter)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			case <-t.C:
+			}
+			continue
 		}
 
 		_ = d.cfg.Statsd.Incr("jack.courier.wal.reconnect", nil, 1)
@@ -288,6 +344,25 @@ func (d *Driver) Run(ctx context.Context, submit courier.SubmitFunc) error {
 		if waitErr := bo.wait(ctx); waitErr != nil {
 			return waitErr
 		}
+	}
+}
+
+func (d *Driver) acquireLeadership() {
+	if d.isLeader.CompareAndSwap(false, true) {
+		d.standbyLogged = false
+		_ = d.cfg.Statsd.Incr("jack.courier.leader.acquired", nil, 1)
+		d.cfg.Logger.Info("acquired leader role", slog.String("slot", d.cfg.SlotName))
+		select {
+		case d.maintWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (d *Driver) relinquishLeadership(reason string) {
+	if d.isLeader.CompareAndSwap(true, false) {
+		_ = d.cfg.Statsd.Incr("jack.courier.leader.relinquished", []string{"reason:" + reason}, 1)
+		d.cfg.Logger.Info("relinquished leader role", slog.String("reason", reason))
 	}
 }
 
@@ -310,6 +385,8 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 	if err := wal.startStreaming(ctx, startLSN); err != nil {
 		return err
 	}
+
+	d.acquireLeadership()
 
 	d.cfg.Logger.Info("WAL streaming started",
 		slog.String("slot", d.cfg.SlotName),

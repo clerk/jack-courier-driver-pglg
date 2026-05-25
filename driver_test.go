@@ -3,7 +3,14 @@ package pglg
 import (
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
+
+func TestDriverRole_DefaultStandby(t *testing.T) {
+	d := &Driver{}
+	assert.Equal(t, "standby", d.Role())
+}
 
 func TestConfigSetDefaults(t *testing.T) {
 	cfg := Config{
@@ -45,6 +52,12 @@ func TestConfigSetDefaults(t *testing.T) {
 	}
 	if cfg.ReconnectMaxDelay != 30*time.Second {
 		t.Errorf("expected ReconnectMaxDelay=30s, got %s", cfg.ReconnectMaxDelay)
+	}
+	if cfg.SlotBusyRetryDelay != 5*time.Second {
+		t.Errorf("expected SlotBusyRetryDelay=5s, got %s", cfg.SlotBusyRetryDelay)
+	}
+	if cfg.SlotBusyRetryJitter != 1*time.Second {
+		t.Errorf("expected SlotBusyRetryJitter=1s, got %s", cfg.SlotBusyRetryJitter)
 	}
 	if cfg.Logger == nil {
 		t.Error("expected non-nil Logger")

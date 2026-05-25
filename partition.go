@@ -10,21 +10,33 @@ import (
 )
 
 // partitionMaintenance runs in a background goroutine, creating future partitions
-// and dropping expired ones on a periodic schedule.
+// and dropping expired ones on a periodic schedule. It runs only while this
+// instance is the leader (i.e. holds the replication slot). Standbys block on
+// maintWake until they acquire leadership.
 func (d *Driver) partitionMaintenance(ctx context.Context) {
-	// Run once immediately on startup.
-	d.runPartitionMaintenance(ctx)
-
 	ticker := time.NewTicker(d.cfg.PartitionMaintInterval)
 	defer ticker.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-d.maintWake:
+	}
+
+	d.runPartitionMaintenance(ctx)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			d.runPartitionMaintenance(ctx)
+		case <-d.maintWake:
 		}
+		if !d.isLeader.Load() {
+			continue
+		}
+
+		d.runPartitionMaintenance(ctx)
 	}
 }
 

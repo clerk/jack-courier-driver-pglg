@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -14,7 +15,19 @@ import (
 // lsn is a type alias for pglogrepl.LSN used throughout the driver.
 type lsn = pglogrepl.LSN
 
-var errStandbyTimeout = errors.New("standby timeout")
+var (
+	errStandbyTimeout = errors.New("standby timeout")
+	errSlotBusy       = errors.New("pglg: replication slot in use by another consumer")
+)
+
+func mapStartReplicationError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.ObjectInUse {
+		return errSlotBusy
+	}
+
+	return fmt.Errorf("pglg: start replication: %w", err)
+}
 
 // walConsumer manages a logical replication connection to PostgreSQL.
 type walConsumer struct {
@@ -75,7 +88,7 @@ func (w *walConsumer) startStreaming(ctx context.Context, startLSN lsn) error {
 			},
 		})
 	if err != nil {
-		return fmt.Errorf("pglg: start replication: %w", err)
+		return mapStartReplicationError(err)
 	}
 
 	w.clientXLogPos = startLSN
