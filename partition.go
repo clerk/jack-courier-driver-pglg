@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -36,6 +38,29 @@ func (d *Driver) runPartitionMaintenance(ctx context.Context) {
 	if err := d.dropExpiredPartitions(ctx); err != nil {
 		_ = d.cfg.Statsd.Incr("jack.courier.partition.error", []string{"op:drop"}, 1)
 		d.cfg.Logger.Error("partition cleanup failed", slog.String("error", err.Error()))
+	}
+
+	for _, r := range d.replicaPools {
+		existing, err := d.listReplicaPartitions(ctx, r)
+		if err != nil {
+			_ = d.cfg.Statsd.Incr("jack.courier.partition.replica_sync_error", []string{"replica:" + r.name, "op:list"}, 1)
+			d.cfg.Logger.Warn("replica partition list failed",
+				slog.String("replica", r.name),
+				slog.String("error", err.Error()))
+			continue
+		}
+		if err := d.createReplicaPartitions(ctx, r, existing); err != nil {
+			_ = d.cfg.Statsd.Incr("jack.courier.partition.replica_sync_error", []string{"replica:" + r.name, "op:create"}, 1)
+			d.cfg.Logger.Warn("replica partition creation failed",
+				slog.String("replica", r.name),
+				slog.String("error", err.Error()))
+		}
+		if err := d.dropExpiredReplicaPartitions(ctx, r, existing); err != nil {
+			_ = d.cfg.Statsd.Incr("jack.courier.partition.replica_sync_error", []string{"replica:" + r.name, "op:drop"}, 1)
+			d.cfg.Logger.Warn("replica partition cleanup failed",
+				slog.String("replica", r.name),
+				slog.String("error", err.Error()))
+		}
 	}
 
 	_ = d.cfg.Statsd.Distribution("jack.courier.partition.maintenance.duration", time.Since(start).Seconds(), nil, 1)
@@ -226,4 +251,167 @@ func (d *Driver) emitPartitionMetrics(ctx context.Context) {
 // partitionName generates a deterministic partition name from a lower-bound timestamp.
 func (d *Driver) partitionName(lower time.Time) string {
 	return fmt.Sprintf("%s_jobs_%s", d.cfg.TablePrefix, lower.Format("20060102_1504"))
+}
+
+type expiredPartition struct {
+	name  string
+	upper time.Time
+}
+
+func (d *Driver) selectExpiredPartitions(existing map[string]bool, cutoff time.Time) []expiredPartition {
+	names := make([]string, 0, len(existing))
+	for n := range existing {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	var toDrop []expiredPartition
+	for _, name := range names {
+		lower, ok := d.parsePartitionLower(name)
+		if !ok {
+			continue
+		}
+		upper := lower.Add(d.cfg.PartitionInterval)
+		if upper.After(cutoff) {
+			continue
+		}
+		toDrop = append(toDrop, expiredPartition{name: name, upper: upper})
+	}
+	return toDrop
+}
+
+func (d *Driver) parsePartitionLower(name string) (time.Time, bool) {
+	prefix := fmt.Sprintf("%s_jobs_", d.cfg.TablePrefix)
+	if !strings.HasPrefix(name, prefix) {
+		return time.Time{}, false
+	}
+
+	t, err := time.Parse("20060102_1504", name[len(prefix):])
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	return t.UTC(), true
+}
+
+func (d *Driver) createReplicaPartitions(ctx context.Context, r replicaPool, existing map[string]bool) error {
+	now := time.Now().UTC()
+	start := now.Add(-d.cfg.PartitionInterval).Truncate(d.cfg.PartitionInterval)
+	end := now.Add(d.cfg.PartitionLookAhead)
+	jobsTable := d.cfg.jobsTable()
+
+	for t := start; t.Before(end); t = t.Add(d.cfg.PartitionInterval) {
+		lower := t.UTC()
+		upper := t.Add(d.cfg.PartitionInterval).UTC()
+		partName := d.partitionName(lower)
+		if existing[partName] {
+			continue
+		}
+
+		createSQL := fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s.%s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')",
+			d.cfg.Schema, partName, jobsTable,
+			lower.Format(time.RFC3339),
+			upper.Format(time.RFC3339),
+		)
+		if _, err := r.pool.Exec(ctx, createSQL); err != nil {
+			return fmt.Errorf("pglg: create replica partition %s on %q: %w", partName, r.name, err)
+		}
+		_ = d.cfg.Statsd.Incr("jack.courier.partition.replica_created", []string{"replica:" + r.name}, 1)
+	}
+
+	return nil
+}
+
+func (d *Driver) listReplicaPartitions(ctx context.Context, r replicaPool) (map[string]bool, error) {
+	parentName := fmt.Sprintf("%s_jobs", d.cfg.TablePrefix)
+	rows, err := r.pool.Query(ctx, `
+		SELECT child.relname
+		  FROM pg_inherits i
+		  JOIN pg_class parent ON i.inhparent = parent.oid
+		  JOIN pg_class child  ON i.inhrelid  = child.oid
+		  JOIN pg_namespace ns ON parent.relnamespace = ns.oid
+		 WHERE ns.nspname = $1 AND parent.relname = $2
+	`, d.cfg.Schema, parentName)
+	if err != nil {
+		return nil, fmt.Errorf("pglg: list replica partitions on %q: %w", r.name, err)
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("pglg: scan replica partition name on %q: %w", r.name, err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pglg: iterate replica partitions on %q: %w", r.name, err)
+	}
+	return existing, nil
+}
+
+func (d *Driver) dropExpiredReplicaPartitions(ctx context.Context, r replicaPool, existing map[string]bool) error {
+	now := time.Now().UTC()
+
+	var lastMsgSendTime *time.Time
+	err := r.pool.QueryRow(ctx,
+		`SELECT last_msg_send_time FROM pg_stat_subscription WHERE subname = $1`,
+		r.subscriptionName,
+	).Scan(&lastMsgSendTime)
+	if err != nil {
+		return fmt.Errorf("pglg: read apply position on %q (subscription %q): %w", r.name, r.subscriptionName, err)
+	}
+
+	if lastMsgSendTime == nil {
+		d.cfg.Logger.Warn("replica apply position unknown, skipping drops",
+			slog.String("replica", r.name),
+			slog.String("subscription", r.subscriptionName))
+		return nil
+	}
+
+	lagSeconds := now.Sub(*lastMsgSendTime).Seconds()
+	if lagSeconds < 0 {
+		lagSeconds = 0
+	}
+	_ = d.cfg.Statsd.Gauge("jack.courier.partition.replica_apply_lag_seconds",
+		lagSeconds, []string{"replica:" + r.name}, 1)
+
+	applyTime := lastMsgSendTime.UTC()
+	if applyTime.After(now) {
+		applyTime = now
+	}
+	cutoff := applyTime.Add(-d.cfg.PartitionRetention)
+
+	toDrop := d.selectExpiredPartitions(existing, cutoff)
+	if len(toDrop) == 0 {
+		return nil
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("pglg: begin tx for replica drop on %q: %w", r.name, err)
+	}
+	defer tx.Rollback(ctx)
+
+	jobsTable := d.cfg.jobsTable()
+	for _, p := range toDrop {
+		detachSQL := fmt.Sprintf("ALTER TABLE %s DETACH PARTITION %s.%s",
+			jobsTable, d.cfg.Schema, p.name)
+		if _, err := tx.Exec(ctx, detachSQL); err != nil {
+			return fmt.Errorf("pglg: detach replica partition %s on %q: %w", p.name, r.name, err)
+		}
+		dropSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", d.cfg.Schema, p.name)
+		if _, err := tx.Exec(ctx, dropSQL); err != nil {
+			return fmt.Errorf("pglg: drop replica partition %s on %q: %w", p.name, r.name, err)
+		}
+		_ = d.cfg.Statsd.Incr("jack.courier.partition.replica_dropped", []string{"replica:" + r.name}, 1)
+		d.cfg.Logger.Info("replica partition dropped",
+			slog.String("replica", r.name),
+			slog.String("name", p.name),
+			slog.Time("upper_bound", p.upper))
+	}
+
+	return tx.Commit(ctx)
 }

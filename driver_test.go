@@ -90,6 +90,62 @@ func TestConfigValidate(t *testing.T) {
 		{"missing ConnString", Config{SlotName: "s", PublicationName: "p"}, true},
 		{"missing SlotName", Config{ConnString: "x", PublicationName: "p"}, true},
 		{"missing PublicationName", Config{ConnString: "x", SlotName: "s"}, true},
+		{
+			"valid with replicas",
+			Config{
+				ConnString:      "x",
+				SlotName:        "s",
+				PublicationName: "p",
+				Replicas: []ReplicaConfig{
+					{Name: "r1", ConnString: "c1", SubscriptionName: "sub1"},
+					{Name: "r2", ConnString: "c2", SubscriptionName: "sub2"},
+				},
+			},
+			false,
+		},
+		{
+			"replica missing Name",
+			Config{
+				ConnString:      "x",
+				SlotName:        "s",
+				PublicationName: "p",
+				Replicas:        []ReplicaConfig{{ConnString: "c", SubscriptionName: "sub"}},
+			},
+			true,
+		},
+		{
+			"replica missing ConnString",
+			Config{
+				ConnString:      "x",
+				SlotName:        "s",
+				PublicationName: "p",
+				Replicas:        []ReplicaConfig{{Name: "r", SubscriptionName: "sub"}},
+			},
+			true,
+		},
+		{
+			"replica missing SubscriptionName",
+			Config{
+				ConnString:      "x",
+				SlotName:        "s",
+				PublicationName: "p",
+				Replicas:        []ReplicaConfig{{Name: "r", ConnString: "c"}},
+			},
+			true,
+		},
+		{
+			"duplicate replica names",
+			Config{
+				ConnString:      "x",
+				SlotName:        "s",
+				PublicationName: "p",
+				Replicas: []ReplicaConfig{
+					{Name: "r1", ConnString: "c1", SubscriptionName: "sub1"},
+					{Name: "r1", ConnString: "c2", SubscriptionName: "sub2"},
+				},
+			},
+			true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -167,5 +223,214 @@ func TestPartitionName(t *testing.T) {
 	want := "billing_jobs_20260216_1400"
 	if got != want {
 		t.Errorf("partitionName() = %s, want %s", got, want)
+	}
+}
+
+func TestParsePartitionLower(t *testing.T) {
+	d := &Driver{cfg: Config{TablePrefix: "job_table_prefix"}}
+
+	tests := []struct {
+		name   string
+		input  string
+		want   time.Time
+		wantOK bool
+	}{
+		{"valid", "job_table_prefix_jobs_20260216_1400", time.Date(2026, 2, 16, 14, 0, 0, 0, time.UTC), true},
+		{"valid midnight", "job_table_prefix_jobs_20260101_0000", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), true},
+		{"wrong prefix", "other_jobs_20260216_1400", time.Time{}, false},
+		{"no jobs segment", "job_table_prefix_20260216_1400", time.Time{}, false},
+		{"malformed timestamp", "job_table_prefix_jobs_2026-02-16", time.Time{}, false},
+		{"extra suffix", "job_table_prefix_jobs_20260216_1400_extra", time.Time{}, false},
+		{"empty", "", time.Time{}, false},
+		{"only prefix", "job_table_prefix_jobs_", time.Time{}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := d.parsePartitionLower(tt.input)
+			if ok != tt.wantOK {
+				t.Fatalf("parsePartitionLower(%q) ok = %v, want %v", tt.input, ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if !got.Equal(tt.want) {
+				t.Errorf("parsePartitionLower(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			if got.Location() != time.UTC {
+				t.Errorf("parsePartitionLower(%q) location = %v, want UTC", tt.input, got.Location())
+			}
+		})
+	}
+}
+
+func TestSelectExpiredPartitions(t *testing.T) {
+	d := &Driver{cfg: Config{TablePrefix: "job_table_prefix", PartitionInterval: time.Hour}}
+
+	makeSet := func(names ...string) map[string]bool {
+		m := make(map[string]bool, len(names))
+		for _, n := range names {
+			m[n] = true
+		}
+		return m
+	}
+
+	t.Run("empty input", func(t *testing.T) {
+		got := d.selectExpiredPartitions(makeSet(), time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC))
+		if len(got) != 0 {
+			t.Errorf("expected empty, got %v", got)
+		}
+	})
+
+	t.Run("non-matching names skipped", func(t *testing.T) {
+		got := d.selectExpiredPartitions(
+			makeSet("unrelated_table", "other_jobs_20260101_0000", "job_table_prefix_jobs_bad"),
+			time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
+		)
+		if len(got) != 0 {
+			t.Errorf("expected empty for non-matching names, got %v", got)
+		}
+	})
+
+	t.Run("upper exactly at cutoff is included", func(t *testing.T) {
+		got := d.selectExpiredPartitions(
+			makeSet("job_table_prefix_jobs_20260525_0900"),
+			time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC),
+		)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 entry, got %d", len(got))
+		}
+		if got[0].name != "job_table_prefix_jobs_20260525_0900" {
+			t.Errorf("unexpected name: %s", got[0].name)
+		}
+	})
+
+	t.Run("upper just past cutoff is excluded", func(t *testing.T) {
+		got := d.selectExpiredPartitions(
+			makeSet("job_table_prefix_jobs_20260525_0900"),
+			time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC).Add(-time.Nanosecond),
+		)
+		if len(got) != 0 {
+			t.Errorf("expected exclusion at upper > cutoff, got %v", got)
+		}
+	})
+
+	t.Run("output sorted oldest-first", func(t *testing.T) {
+		got := d.selectExpiredPartitions(
+			makeSet(
+				"job_table_prefix_jobs_20260525_0900",
+				"job_table_prefix_jobs_20260525_0700",
+				"job_table_prefix_jobs_20260525_0800",
+			),
+			time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+		)
+		if len(got) != 3 {
+			t.Fatalf("expected 3 entries, got %d", len(got))
+		}
+		want := []string{
+			"job_table_prefix_jobs_20260525_0700",
+			"job_table_prefix_jobs_20260525_0800",
+			"job_table_prefix_jobs_20260525_0900",
+		}
+		for i, w := range want {
+			if got[i].name != w {
+				t.Errorf("entry %d: got %s, want %s", i, got[i].name, w)
+			}
+		}
+	})
+
+	t.Run("mix of matching and non-matching", func(t *testing.T) {
+		got := d.selectExpiredPartitions(
+			makeSet(
+				"job_table_prefix_jobs_20260525_0900",
+				"unrelated_table",
+				"job_table_prefix_jobs_20260525_1100",
+				"random_table_jobs_20260525_0900",
+			),
+			time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+		)
+		if len(got) != 2 {
+			t.Fatalf("expected 2 matching entries, got %d", len(got))
+		}
+	})
+}
+
+func TestSelectExpiredPartitions_IntervalAffectsUpper(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		interval    time.Duration
+		partition   string
+		cutoff      time.Time
+		shouldDrop  bool
+		expectUpper time.Time
+	}{
+		{
+			name:        "1h interval, upper at cutoff",
+			interval:    time.Hour,
+			partition:   "job_table_prefix_jobs_20260525_0900",
+			cutoff:      time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC),
+			shouldDrop:  true,
+			expectUpper: time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			name:        "30m interval, upper at cutoff",
+			interval:    30 * time.Minute,
+			partition:   "job_table_prefix_jobs_20260525_0900",
+			cutoff:      time.Date(2026, 5, 25, 9, 30, 0, 0, time.UTC),
+			shouldDrop:  true,
+			expectUpper: time.Date(2026, 5, 25, 9, 30, 0, 0, time.UTC),
+		},
+		{
+			name:       "24h interval, upper after cutoff",
+			interval:   24 * time.Hour,
+			partition:  "job_table_prefix_jobs_20260525_0900",
+			cutoff:     time.Date(2026, 5, 26, 8, 0, 0, 0, time.UTC),
+			shouldDrop: false,
+		},
+		{
+			name:        "24h interval, upper at cutoff",
+			interval:    24 * time.Hour,
+			partition:   "job_table_prefix_jobs_20260525_0900",
+			cutoff:      time.Date(2026, 5, 26, 9, 0, 0, 0, time.UTC),
+			shouldDrop:  true,
+			expectUpper: time.Date(2026, 5, 26, 9, 0, 0, 0, time.UTC),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Driver{cfg: Config{TablePrefix: "job_table_prefix", PartitionInterval: tc.interval}}
+			got := d.selectExpiredPartitions(map[string]bool{tc.partition: true}, tc.cutoff)
+			if tc.shouldDrop {
+				if len(got) != 1 {
+					t.Fatalf("expected 1 entry, got %d", len(got))
+				}
+				if !got[0].upper.Equal(tc.expectUpper) {
+					t.Errorf("upper = %v, want %v", got[0].upper, tc.expectUpper)
+				}
+			} else {
+				if len(got) != 0 {
+					t.Errorf("expected exclusion, got %v", got)
+				}
+			}
+		})
+	}
+}
+
+func TestParsePartitionLower_RoundTrip(t *testing.T) {
+	d := &Driver{cfg: Config{TablePrefix: "job_table_prefix"}}
+
+	for _, lower := range []time.Time{
+		time.Date(2026, 2, 16, 14, 0, 0, 0, time.UTC),
+		time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC),
+		time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		name := d.partitionName(lower)
+		got, ok := d.parsePartitionLower(name)
+		if !ok {
+			t.Errorf("round-trip failed: parsePartitionLower(%q) ok = false", name)
+			continue
+		}
+		if !got.Equal(lower) {
+			t.Errorf("round-trip mismatch for %v: name = %q, parsed = %v", lower, name, got)
+		}
 	}
 }
