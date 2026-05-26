@@ -173,6 +173,8 @@ CREATE TABLE {schema}.{prefix}_jobs (
 | `PartitionMaintInterval` | No | `5m` | Partition maintenance loop interval |
 | `ReconnectInitialDelay` | No | `1s` | Initial reconnection delay |
 | `ReconnectMaxDelay` | No | `30s` | Max reconnection delay |
+| `DLQRetention` | No | `720h` (30d) | How long dead-lettered rows are kept |
+| `DLQCleanupInterval` | No | `1h` | How often the leader prunes old DLQ rows |
 | `Logger` | No | `slog.Default()` | Structured logger |
 
 ### Environment variables (via ConfigFromEnv)
@@ -187,11 +189,13 @@ CREATE TABLE {schema}.{prefix}_jobs (
 | `PGLG_MAX_BATCH_SIZE` | `MaxBatchSize` |
 | `PGLG_BATCH_TIMEOUT` | `BatchTimeout` |
 | `PGLG_STANDBY_INTERVAL` | `StandbyInterval` |
+| `PGLG_DLQ_RETENTION` | `DLQRetention` |
+| `PGLG_DLQ_CLEANUP_INTERVAL` | `DLQCleanupInterval` |
 
 ## Delivery Guarantees
 
 - **At-least-once delivery.** If the gRPC call to jack-service fails, the cursor is not advanced. The driver reconnects and re-streams from the last saved position.
-- **Per-job rejections** (unknown job type, invalid payload) are logged as warnings and the cursor advances past them. These are permanent failures that retrying won't fix.
+- **Per-job rejections** (unknown job type, invalid payload) are dead-lettered to `{prefix}_dlq` in the same transaction as the cursor advance, then the cursor moves past them. No per-job rejection is skipped without a durable record.
 
 ## Partition Management
 
