@@ -74,6 +74,10 @@ type Config struct {
 	// to avoid thundering herd on simultaneous standby retries. Default: 1s.
 	SlotBusyRetryJitter time.Duration
 
+	// LeaderHeartbeatInterval is how often each replica emits the
+	// jack.courier.leader.is_leader gauge (1 for leader, 0 for standby). Default: 15s.
+	LeaderHeartbeatInterval time.Duration
+
 	// Logger is the structured logger. Default: slog.Default().
 	Logger *slog.Logger
 
@@ -130,6 +134,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.SlotBusyRetryJitter <= 0 {
 		c.SlotBusyRetryJitter = 1 * time.Second
+	}
+	if c.LeaderHeartbeatInterval <= 0 {
+		c.LeaderHeartbeatInterval = 15 * time.Second
 	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
@@ -305,6 +312,7 @@ func (d *Driver) Run(ctx context.Context, submit courier.SubmitFunc) error {
 
 	// Start partition maintenance goroutine.
 	go d.partitionMaintenance(ctx)
+	go d.leaderHeartbeat(ctx)
 
 	bo := &backoff{
 		initial:    d.cfg.ReconnectInitialDelay,
@@ -351,6 +359,7 @@ func (d *Driver) acquireLeadership() {
 	if d.isLeader.CompareAndSwap(false, true) {
 		d.standbyLogged = false
 		_ = d.cfg.Statsd.Incr("jack.courier.leader.acquired", nil, 1)
+		d.emitLeaderGauge()
 		d.cfg.Logger.Info("acquired leader role", slog.String("slot", d.cfg.SlotName))
 		select {
 		case d.maintWake <- struct{}{}:
@@ -359,9 +368,32 @@ func (d *Driver) acquireLeadership() {
 	}
 }
 
+func (d *Driver) emitLeaderGauge() {
+	v := 0.0
+	if d.isLeader.Load() {
+		v = 1.0
+	}
+	_ = d.cfg.Statsd.Gauge("jack.courier.leader.is_leader", v, nil, 1)
+}
+
+func (d *Driver) leaderHeartbeat(ctx context.Context) {
+	d.emitLeaderGauge()
+	t := time.NewTicker(d.cfg.LeaderHeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.emitLeaderGauge()
+		}
+	}
+}
+
 func (d *Driver) relinquishLeadership(reason string) {
 	if d.isLeader.CompareAndSwap(true, false) {
 		_ = d.cfg.Statsd.Incr("jack.courier.leader.relinquished", []string{"reason:" + reason}, 1)
+		d.emitLeaderGauge()
 		d.cfg.Logger.Info("relinquished leader role", slog.String("reason", reason))
 	}
 }

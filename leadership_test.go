@@ -1,8 +1,10 @@
 package pglg
 
 import (
+	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/DataDog/datadog-go/v5/statsd"
 	"github.com/stretchr/testify/assert"
@@ -13,10 +15,17 @@ type incrCall struct {
 	tags []string
 }
 
+type gaugeCall struct {
+	name  string
+	value float64
+	tags  []string
+}
+
 type recordingStatsd struct {
 	statsd.NoOpClient
-	mu    sync.Mutex
-	incrs []incrCall
+	mu     sync.Mutex
+	incrs  []incrCall
+	gauges []gaugeCall
 }
 
 func (r *recordingStatsd) Incr(name string, tags []string, _ float64) error {
@@ -26,10 +35,23 @@ func (r *recordingStatsd) Incr(name string, tags []string, _ float64) error {
 	return nil
 }
 
+func (r *recordingStatsd) Gauge(name string, value float64, tags []string, _ float64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gauges = append(r.gauges, gaugeCall{name: name, value: value, tags: append([]string(nil), tags...)})
+	return nil
+}
+
 func (r *recordingStatsd) calls() []incrCall {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]incrCall(nil), r.incrs...)
+}
+
+func (r *recordingStatsd) gaugeCalls() []gaugeCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]gaugeCall(nil), r.gauges...)
 }
 
 func newTestDriver(rs *recordingStatsd) *Driver {
@@ -155,4 +177,45 @@ func TestRelinquishLeadership_DoubleCallEmitsOnce(t *testing.T) {
 	d.relinquishLeadership("shutdown")
 
 	assert.Len(t, rs.calls(), 1, "double relinquish should emit metric only once")
+}
+
+func TestLeaderHeartbeat(t *testing.T) {
+	rs := &recordingStatsd{}
+	d := newTestDriver(rs)
+	d.cfg.LeaderHeartbeatInterval = 10 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		d.leaderHeartbeat(ctx)
+		close(done)
+	}()
+
+	assert.Eventually(t, func() bool {
+		for _, g := range rs.gaugeCalls() {
+			if g.name == "jack.courier.leader.is_leader" && g.value == 0 {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond, "expected at least one standby (value=0) emission")
+
+	d.isLeader.Store(true)
+
+	assert.Eventually(t, func() bool {
+		for _, g := range rs.gaugeCalls() {
+			if g.name == "jack.courier.leader.is_leader" && g.value == 1 {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond, "expected a leader (value=1) emission after isLeader flipped")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("leaderHeartbeat did not exit after context cancel")
+	}
 }
