@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jackc/pglogrepl"
 	courier "github.com/clerk/jack-courier-lib"
+	"github.com/jackc/pglogrepl"
 )
 
 // WAL message types used as internal representations after parsing.
@@ -21,6 +21,7 @@ type walRelation struct {
 type walInsert struct {
 	relationID uint32
 	values     []columnValue
+	xid        uint32
 }
 
 type columnValue struct {
@@ -32,14 +33,21 @@ type walCommit struct {
 	commitLSN lsn
 }
 
-type walStreamStart struct{}
-type walStreamStop struct{}
+type walBegin struct{}
+
+type (
+	walStreamStart struct{}
+	walStreamStop  struct{}
+)
 
 type walStreamCommit struct {
 	commitLSN lsn
 }
 
-type walStreamAbort struct{}
+type walStreamAbort struct {
+	xid    uint32
+	subXid uint32
+}
 
 // parseWALMessage parses a raw pgoutput v2 WAL message into an internal type.
 func parseWALMessage(walData []byte, inStream bool) (any, error) {
@@ -71,13 +79,13 @@ func parseWALMessage(walData []byte, inStream bool) (any, error) {
 				data:   string(col.Data),
 			}
 		}
-		return &walInsert{relationID: m.RelationID, values: vals}, nil
+		return &walInsert{relationID: m.RelationID, values: vals, xid: m.Xid}, nil
 
 	case *pglogrepl.CommitMessage:
 		return &walCommit{commitLSN: m.TransactionEndLSN}, nil
 
 	case *pglogrepl.BeginMessage:
-		return nil, nil // no-op, we don't need begin markers
+		return &walBegin{}, nil
 
 	case *pglogrepl.StreamStartMessageV2:
 		return &walStreamStart{}, nil
@@ -89,7 +97,7 @@ func parseWALMessage(walData []byte, inStream bool) (any, error) {
 		return &walStreamCommit{commitLSN: m.TransactionEndLSN}, nil
 
 	case *pglogrepl.StreamAbortMessageV2:
-		return &walStreamAbort{}, nil
+		return &walStreamAbort{xid: m.Xid, subXid: m.SubXid}, nil
 
 	default:
 		return nil, nil // ignore unhandled message types
@@ -204,13 +212,32 @@ func parseTimestamp(s string) (time.Time, error) {
 
 // txBuffer accumulates parsed inserts within a single WAL transaction.
 type txBuffer struct {
-	inserts []parsedInsert
+	inserts []bufferedInsert
+}
+
+type bufferedInsert struct {
+	row parsedInsert
+	xid uint32
 }
 
 func (tb *txBuffer) reset() {
 	tb.inserts = tb.inserts[:0]
 }
 
-func (tb *txBuffer) addInsert(p parsedInsert) {
-	tb.inserts = append(tb.inserts, p)
+func (tb *txBuffer) empty() bool {
+	return len(tb.inserts) == 0
+}
+
+func (tb *txBuffer) addInsert(p parsedInsert, xid uint32) {
+	tb.inserts = append(tb.inserts, bufferedInsert{row: p, xid: xid})
+}
+
+func (tb *txBuffer) removeXID(xid uint32) {
+	kept := tb.inserts[:0]
+	for _, ins := range tb.inserts {
+		if ins.xid != xid {
+			kept = append(kept, ins)
+		}
+	}
+	tb.inserts = kept
 }

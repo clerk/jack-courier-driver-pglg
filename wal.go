@@ -34,13 +34,15 @@ type walConsumer struct {
 	conn            *pgconn.PgConn
 	slotName        string
 	publicationName string
-	standbyInterval time.Duration
 
 	// relations maps relation OID to metadata for parsing INSERT messages.
 	relations map[uint32]*relationMeta
 
 	// clientXLogPos tracks the position we've received up to.
 	clientXLogPos lsn
+
+	// flushLSN tracks the position we've durably processed and persisted.
+	flushLSN lsn
 }
 
 type relationMeta struct {
@@ -48,11 +50,10 @@ type relationMeta struct {
 	columns []string
 }
 
-func newWALConsumer(slotName, publicationName string, standbyInterval time.Duration) *walConsumer {
+func newWALConsumer(slotName, publicationName string) *walConsumer {
 	return &walConsumer{
 		slotName:        slotName,
 		publicationName: publicationName,
-		standbyInterval: standbyInterval,
 		relations:       make(map[uint32]*relationMeta),
 	}
 }
@@ -92,14 +93,14 @@ func (w *walConsumer) startStreaming(ctx context.Context, startLSN lsn) error {
 	}
 
 	w.clientXLogPos = startLSN
+	w.flushLSN = startLSN
 	return nil
 }
 
 // receiveMessage receives the next WAL data payload. Returns nil data for
-// keepalive-only messages. Returns errStandbyTimeout when the standby interval
-// elapses with no message.
-func (w *walConsumer) receiveMessage(ctx context.Context) ([]byte, error) {
-	deadline := time.Now().Add(w.standbyInterval)
+// keepalive-only messages. Returns errStandbyTimeout when the deadline elapses
+// with no message.
+func (w *walConsumer) receiveMessage(ctx context.Context, deadline time.Time) ([]byte, error) {
 	receiveCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
@@ -153,13 +154,50 @@ func (w *walConsumer) sendStandbyStatus(ctx context.Context) error {
 	// if the parent context is being cancelled during shutdown.
 	statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	return pglogrepl.SendStandbyStatusUpdate(statusCtx, w.conn,
-		pglogrepl.StandbyStatusUpdate{
-			WALWritePosition: w.clientXLogPos,
-			WALFlushPosition: w.clientXLogPos,
-			WALApplyPosition: w.clientXLogPos,
-			ClientTime:       time.Now().UTC(),
-		})
+	return pglogrepl.SendStandbyStatusUpdate(statusCtx, w.conn, w.standbyStatusUpdate(time.Now().UTC()))
+}
+
+func (w *walConsumer) standbyStatusUpdate(now time.Time) pglogrepl.StandbyStatusUpdate {
+	writeLSN := w.clientXLogPos
+	if w.flushLSN == 0 {
+		// flushLSN is 0 only when the cursor table has no row for this slot
+		// and we have not flushed anything yet in this session. This is the
+		// first-ever run on a fresh(the initial) deployment.
+		//
+		// pglogrepl replaces a zero flush/apply with the write position. If
+		// we sent {Write: clientXLogPos, Flush: 0, Apply: 0}, it would put
+		// clientXLogPos in all three fields. That would tell PG we durably
+		// flushed everything we received, which is a lie, and PG would
+		// reclaim WAL we have not handled.
+		//
+		// Send all zeros instead. PG does not advance confirmed_flush_lsn,
+		// and no WAL is reclaimed until ther first real flush sets a
+		// non zero flushLSN.
+		writeLSN = 0
+	} else if writeLSN < w.flushLSN {
+		writeLSN = w.flushLSN
+	}
+
+	return pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: writeLSN,
+		WALFlushPosition: w.flushLSN,
+		WALApplyPosition: w.flushLSN,
+		ClientTime:       now,
+	}
+}
+
+func (w *walConsumer) setFlushLSN(l lsn) {
+	if l > w.flushLSN {
+		w.flushLSN = l
+	}
+}
+
+func (w *walConsumer) writePos() lsn {
+	return w.clientXLogPos
+}
+
+func (w *walConsumer) receivedPastFlush() bool {
+	return w.clientXLogPos > w.flushLSN
 }
 
 // close terminates the replication connection.

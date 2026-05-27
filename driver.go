@@ -36,7 +36,10 @@ type Config struct {
 	// Default: "outbox".
 	TablePrefix string
 
-	// MaxBatchSize is the maximum number of jobs per submit() call. Default: 100.
+	// MaxBatchSize is the flush trigger: when pending jobs reach this number
+	// the driver flushes immediately instead of waiting for BatchTimeout.
+	// It is NOT a hard cap on submit() — a single transaction with more rows
+	// than this is still shipped in one submit() call. Default: 100.
 	MaxBatchSize int
 
 	// BatchTimeout is the max time to wait for a full batch before flushing.
@@ -438,7 +441,7 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 	}
 
 	// 2. Connect WAL consumer.
-	wal := newWALConsumer(d.cfg.SlotName, d.cfg.PublicationName, d.cfg.StandbyInterval)
+	wal := newWALConsumer(d.cfg.SlotName, d.cfg.PublicationName)
 	if err := wal.connect(ctx, d.cfg.ConnString); err != nil {
 		return err
 	}
@@ -461,10 +464,11 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		pendingInserts   []parsedInsert
 		pendingCommitLSN = startLSN
 		inStream         bool
+		inTx             bool
 	)
 
-	batchTimer := time.NewTimer(d.cfg.BatchTimeout)
-	defer batchTimer.Stop()
+	var nextBatchAt time.Time
+	nextStandbyAt := time.Now().Add(d.cfg.StandbyInterval)
 
 	for {
 		select {
@@ -473,19 +477,33 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		default:
 		}
 
-		walData, err := wal.receiveMessage(ctx)
-		if err == errStandbyTimeout {
-			if sendErr := wal.sendStandbyStatus(ctx); sendErr != nil {
-				return fmt.Errorf("pglg: standby status: %w", sendErr)
-			}
-			// Flush any pending jobs on timeout.
+		now := time.Now()
+		if !nextBatchAt.IsZero() && !now.Before(nextBatchAt) {
 			if len(pendingInserts) > 0 {
 				if flushErr := d.flushBatch(ctx, submit, wal, pendingInserts, pendingCommitLSN); flushErr != nil {
 					return flushErr
 				}
 				pendingInserts = pendingInserts[:0]
 			}
-			batchTimer.Reset(d.cfg.BatchTimeout)
+			nextBatchAt = time.Time{}
+			now = time.Now()
+		}
+		if !now.Before(nextStandbyAt) {
+			if canAdvanceIdleFlush(pendingInserts, buf, inTx) && wal.receivedPastFlush() {
+				flushLSN := wal.writePos()
+				if err := d.persistFlushResult(ctx, nil, flushLSN); err != nil {
+					return err
+				}
+				wal.setFlushLSN(flushLSN)
+			}
+			if sendErr := wal.sendStandbyStatus(ctx); sendErr != nil {
+				return fmt.Errorf("pglg: standby status: %w", sendErr)
+			}
+			nextStandbyAt = time.Now().Add(d.cfg.StandbyInterval)
+		}
+
+		walData, err := wal.receiveMessage(ctx, nextReceiveDeadline(nextBatchAt, nextStandbyAt))
+		if errors.Is(err, errStandbyTimeout) {
 			continue
 		}
 		if err != nil {
@@ -497,11 +515,12 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 
 		msg, err := parseWALMessage(walData, inStream)
 		if err != nil {
-			d.cfg.Logger.Warn("failed to parse WAL message", slog.String("error", err.Error()))
-			continue
+			return fmt.Errorf("pglg: parse WAL message at lsn %s: %w", wal.writePos(), err)
 		}
 
 		switch ev := msg.(type) {
+		case *walBegin:
+			inTx = true
 		case *walRelation:
 			wal.setRelation(ev.id, ev.name, ev.columns)
 		case *walInsert:
@@ -512,55 +531,71 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 				continue
 			}
 			if job != nil {
-				buf.addInsert(*job)
+				buf.addInsert(*job, ev.xid)
 			}
 		case *walCommit:
+			wasPendingEmpty := len(pendingInserts) == 0
 			for i := range buf.inserts {
-				d.recordRowAge(&buf.inserts[i])
-				pendingInserts = append(pendingInserts, buf.inserts[i])
+				d.recordRowAge(&buf.inserts[i].row)
+				pendingInserts = append(pendingInserts, buf.inserts[i].row)
 			}
 			if ev.commitLSN > pendingCommitLSN {
 				pendingCommitLSN = ev.commitLSN
 			}
 			buf.reset()
+			inTx = false
+			if wasPendingEmpty && len(pendingInserts) > 0 {
+				nextBatchAt = time.Now().Add(d.cfg.BatchTimeout)
+			}
 
 			if len(pendingInserts) >= d.cfg.MaxBatchSize {
 				if flushErr := d.flushBatch(ctx, submit, wal, pendingInserts, pendingCommitLSN); flushErr != nil {
 					return flushErr
 				}
 				pendingInserts = pendingInserts[:0]
-				batchTimer.Reset(d.cfg.BatchTimeout)
+				nextBatchAt = time.Time{}
 			}
+		// the driver does not support streaming transactions
+		// the above cases won't be reached, but we keep here in case we need to add support in the future
 		case *walStreamStart:
 			inStream = true
+			inTx = true
 		case *walStreamStop:
 			inStream = false
 		case *walStreamCommit:
+			wasPendingEmpty := len(pendingInserts) == 0
 			for i := range buf.inserts {
-				d.recordRowAge(&buf.inserts[i])
-				pendingInserts = append(pendingInserts, buf.inserts[i])
+				d.recordRowAge(&buf.inserts[i].row)
+				pendingInserts = append(pendingInserts, buf.inserts[i].row)
 			}
 			if ev.commitLSN > pendingCommitLSN {
 				pendingCommitLSN = ev.commitLSN
 			}
 			buf.reset()
-		case *walStreamAbort:
-			buf.reset()
-		}
-
-		// Check batch timer (non-blocking).
-		select {
-		case <-batchTimer.C:
-			if len(pendingInserts) > 0 {
-				if flushErr := d.flushBatch(ctx, submit, wal, pendingInserts, pendingCommitLSN); flushErr != nil {
-					return flushErr
-				}
-				pendingInserts = pendingInserts[:0]
+			inTx = false
+			if wasPendingEmpty && len(pendingInserts) > 0 {
+				nextBatchAt = time.Now().Add(d.cfg.BatchTimeout)
 			}
-			batchTimer.Reset(d.cfg.BatchTimeout)
-		default:
+		case *walStreamAbort:
+			if ev.xid == ev.subXid {
+				buf.reset()
+				inTx = false
+			} else {
+				buf.removeXID(ev.subXid)
+			}
 		}
 	}
+}
+
+func nextReceiveDeadline(nextBatchAt, nextStandbyAt time.Time) time.Time {
+	if nextBatchAt.IsZero() || nextStandbyAt.Before(nextBatchAt) {
+		return nextStandbyAt
+	}
+	return nextBatchAt
+}
+
+func canAdvanceIdleFlush(pendingInserts []parsedInsert, buf txBuffer, inTx bool) bool {
+	return len(pendingInserts) == 0 && buf.empty() && !inTx
 }
 
 // recordRowAge emits the time-since-row-creation as a distribution so
@@ -625,6 +660,7 @@ func (d *Driver) flushBatch(
 	if err := d.persistFlushResult(ctx, dlqRows, commitLSN); err != nil {
 		return err
 	}
+	wal.setFlushLSN(commitLSN)
 
 	if err := wal.sendStandbyStatus(ctx); err != nil {
 		d.cfg.Logger.Warn("failed to send standby status after flush",
