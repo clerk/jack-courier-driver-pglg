@@ -33,8 +33,7 @@ func (d *Driver) readCursor(ctx context.Context) (lsn, error) {
 	return lsn(parsed), nil
 }
 
-// writeCursor persists the confirmed LSN to the cursor table (UPSERT).
-func (d *Driver) writeCursor(ctx context.Context, l lsn) error {
+func (d *Driver) writeCursorTx(ctx context.Context, tx pgx.Tx, l lsn) error {
 	query := fmt.Sprintf(`
 		INSERT INTO %s (slot_name, last_lsn, updated_at)
 		VALUES ($1, $2::pg_lsn, now())
@@ -42,8 +41,7 @@ func (d *Driver) writeCursor(ctx context.Context, l lsn) error {
 		DO UPDATE SET last_lsn = EXCLUDED.last_lsn, updated_at = now()
 	`, d.cfg.cursorTable())
 
-	_, err := d.pool.Exec(ctx, query, d.cfg.SlotName, pglogrepl.LSN(l).String())
-	if err != nil {
+	if _, err := tx.Exec(ctx, query, d.cfg.SlotName, pglogrepl.LSN(l).String()); err != nil {
 		return fmt.Errorf("pglg: write cursor: %w", err)
 	}
 	return nil

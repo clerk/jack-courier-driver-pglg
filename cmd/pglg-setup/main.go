@@ -285,6 +285,7 @@ func runDestroy(ctx context.Context, conn *pgx.Conn, schema, prefix, publication
 		fmt.Sprintf("%s.%s_jobs", schema, prefix),
 		fmt.Sprintf("%s.%s_cursor", schema, prefix),
 		fmt.Sprintf("%s.%s_partition_meta", schema, prefix),
+		fmt.Sprintf("%s.%s_dlq", schema, prefix),
 	}
 	for _, t := range tables {
 		fmt.Printf("dropping table %s...\n", t)

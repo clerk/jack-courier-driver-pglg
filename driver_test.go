@@ -59,6 +59,12 @@ func TestConfigSetDefaults(t *testing.T) {
 	if cfg.SlotBusyRetryJitter != 1*time.Second {
 		t.Errorf("expected SlotBusyRetryJitter=1s, got %s", cfg.SlotBusyRetryJitter)
 	}
+	if cfg.DLQRetention != 30*24*time.Hour {
+		t.Errorf("expected DLQRetention=720h, got %s", cfg.DLQRetention)
+	}
+	if cfg.DLQCleanupInterval != 1*time.Hour {
+		t.Errorf("expected DLQCleanupInterval=1h, got %s", cfg.DLQCleanupInterval)
+	}
 	if cfg.Logger == nil {
 		t.Error("expected non-nil Logger")
 	}
@@ -183,6 +189,9 @@ func TestConfigTableNames(t *testing.T) {
 	}
 	if got := cfg.partitionMetaTable(); got != "myschema.billing_partition_meta" {
 		t.Errorf("partitionMetaTable() = %s, want myschema.billing_partition_meta", got)
+	}
+	if got := cfg.dlqTable(); got != "myschema.billing_dlq" {
+		t.Errorf("dlqTable() = %s, want myschema.billing_dlq", got)
 	}
 }
 

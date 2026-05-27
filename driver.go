@@ -78,6 +78,12 @@ type Config struct {
 	// jack.courier.leader.is_leader gauge (1 for leader, 0 for standby). Default: 15s.
 	LeaderHeartbeatInterval time.Duration
 
+	// DLQRetention is how long DLQ rows are kept. Default: 30 days.
+	DLQRetention time.Duration
+
+	// DLQCleanupInterval is how often the leader prunes old DLQ rows. Default: 1h.
+	DLQCleanupInterval time.Duration
+
 	// Logger is the structured logger. Default: slog.Default().
 	Logger *slog.Logger
 
@@ -138,6 +144,12 @@ func (c *Config) setDefaults() {
 	if c.LeaderHeartbeatInterval <= 0 {
 		c.LeaderHeartbeatInterval = 15 * time.Second
 	}
+	if c.DLQRetention <= 0 {
+		c.DLQRetention = 30 * 24 * time.Hour
+	}
+	if c.DLQCleanupInterval <= 0 {
+		c.DLQCleanupInterval = 1 * time.Hour
+	}
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
@@ -192,6 +204,10 @@ func (c *Config) partitionMetaTable() string {
 	return fmt.Sprintf("%s.%s_partition_meta", c.Schema, c.TablePrefix)
 }
 
+func (c *Config) dlqTable() string {
+	return fmt.Sprintf("%s.%s_dlq", c.Schema, c.TablePrefix)
+}
+
 // ConfigFromEnv reads configuration from PGLG_* environment variables.
 // Required: PGLG_CONN_STRING, PGLG_SLOT_NAME, PGLG_PUBLICATION_NAME.
 func ConfigFromEnv() (Config, error) {
@@ -223,6 +239,20 @@ func ConfigFromEnv() (Config, error) {
 			return Config{}, fmt.Errorf("pglg: invalid PGLG_STANDBY_INTERVAL: %w", err)
 		}
 		cfg.StandbyInterval = d
+	}
+	if v := os.Getenv("PGLG_DLQ_RETENTION"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("pglg: invalid PGLG_DLQ_RETENTION: %w", err)
+		}
+		cfg.DLQRetention = d
+	}
+	if v := os.Getenv("PGLG_DLQ_CLEANUP_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("pglg: invalid PGLG_DLQ_CLEANUP_INTERVAL: %w", err)
+		}
+		cfg.DLQCleanupInterval = d
 	}
 
 	if dsn := os.Getenv("PGLG_REPLICA_CONN_STRING"); dsn != "" {
@@ -313,6 +343,7 @@ func (d *Driver) Run(ctx context.Context, submit courier.SubmitFunc) error {
 	// Start partition maintenance goroutine.
 	go d.partitionMaintenance(ctx)
 	go d.leaderHeartbeat(ctx)
+	go d.dlqCleanup(ctx)
 
 	bo := &backoff{
 		initial:    d.cfg.ReconnectInitialDelay,
@@ -427,7 +458,7 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 	// 4. Receive loop.
 	var (
 		buf              txBuffer
-		pendingJobs      []courier.Job
+		pendingInserts   []parsedInsert
 		pendingCommitLSN = startLSN
 		inStream         bool
 	)
@@ -448,11 +479,11 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 				return fmt.Errorf("pglg: standby status: %w", sendErr)
 			}
 			// Flush any pending jobs on timeout.
-			if len(pendingJobs) > 0 {
-				if flushErr := d.flushBatch(ctx, submit, wal, pendingJobs, pendingCommitLSN); flushErr != nil {
+			if len(pendingInserts) > 0 {
+				if flushErr := d.flushBatch(ctx, submit, wal, pendingInserts, pendingCommitLSN); flushErr != nil {
 					return flushErr
 				}
-				pendingJobs = pendingJobs[:0]
+				pendingInserts = pendingInserts[:0]
 			}
 			batchTimer.Reset(d.cfg.BatchTimeout)
 			continue
@@ -486,18 +517,18 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		case *walCommit:
 			for i := range buf.inserts {
 				d.recordRowAge(&buf.inserts[i])
-				pendingJobs = append(pendingJobs, buf.inserts[i].toJob())
+				pendingInserts = append(pendingInserts, buf.inserts[i])
 			}
 			if ev.commitLSN > pendingCommitLSN {
 				pendingCommitLSN = ev.commitLSN
 			}
 			buf.reset()
 
-			if len(pendingJobs) >= d.cfg.MaxBatchSize {
-				if flushErr := d.flushBatch(ctx, submit, wal, pendingJobs, pendingCommitLSN); flushErr != nil {
+			if len(pendingInserts) >= d.cfg.MaxBatchSize {
+				if flushErr := d.flushBatch(ctx, submit, wal, pendingInserts, pendingCommitLSN); flushErr != nil {
 					return flushErr
 				}
-				pendingJobs = pendingJobs[:0]
+				pendingInserts = pendingInserts[:0]
 				batchTimer.Reset(d.cfg.BatchTimeout)
 			}
 		case *walStreamStart:
@@ -507,7 +538,7 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		case *walStreamCommit:
 			for i := range buf.inserts {
 				d.recordRowAge(&buf.inserts[i])
-				pendingJobs = append(pendingJobs, buf.inserts[i].toJob())
+				pendingInserts = append(pendingInserts, buf.inserts[i])
 			}
 			if ev.commitLSN > pendingCommitLSN {
 				pendingCommitLSN = ev.commitLSN
@@ -520,11 +551,11 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		// Check batch timer (non-blocking).
 		select {
 		case <-batchTimer.C:
-			if len(pendingJobs) > 0 {
-				if flushErr := d.flushBatch(ctx, submit, wal, pendingJobs, pendingCommitLSN); flushErr != nil {
+			if len(pendingInserts) > 0 {
+				if flushErr := d.flushBatch(ctx, submit, wal, pendingInserts, pendingCommitLSN); flushErr != nil {
 					return flushErr
 				}
-				pendingJobs = pendingJobs[:0]
+				pendingInserts = pendingInserts[:0]
 			}
 			batchTimer.Reset(d.cfg.BatchTimeout)
 		default:
@@ -545,16 +576,22 @@ func (d *Driver) recordRowAge(p *parsedInsert) {
 		[]string{"job_type:" + p.jobType}, 1)
 }
 
-// flushBatch submits a batch of jobs and advances the cursor on success.
+// flushBatch submits a batch and advances the cursor. Rejections go to the
+// DLQ in the same transaction so no row is ever lost.
 func (d *Driver) flushBatch(
 	ctx context.Context,
 	submit courier.SubmitFunc,
 	wal *walConsumer,
-	jobs []courier.Job,
+	inserts []parsedInsert,
 	commitLSN lsn,
 ) error {
-	if len(jobs) == 0 {
+	if len(inserts) == 0 {
 		return nil
+	}
+
+	jobs := make([]courier.Job, len(inserts))
+	for i := range inserts {
+		jobs[i] = inserts[i].toJob()
 	}
 
 	d.cfg.Logger.Debug("submitting batch",
@@ -570,37 +607,64 @@ func (d *Driver) flushBatch(
 		return fmt.Errorf("pglg: submit failed: %w", err)
 	}
 
-	var failCount int
+	dlqRows, err := mapResults(inserts, results)
+	if err != nil {
+		_ = d.cfg.Statsd.Incr("jack.courier.flush.count", []string{"status:error"}, 1)
+		return fmt.Errorf("pglg: jack response inconsistent: %w", err)
+	}
+
 	for _, r := range results {
 		if r.Err != "" {
-			failCount++
 			d.cfg.Logger.Warn("job submit rejected",
 				slog.String("correlation_id", r.CorrelationID),
-				slog.String("error", r.Err))
+				slog.String("error", r.Err),
+				slog.String("reason", r.Reason))
 		}
 	}
 
-	// Advance cursor even on partial per-job failures (permanent rejections).
-	if err := d.writeCursor(ctx, commitLSN); err != nil {
-		return fmt.Errorf("pglg: write cursor: %w", err)
+	if err := d.persistFlushResult(ctx, dlqRows, commitLSN); err != nil {
+		return err
 	}
 
-	// Send standby status to Postgres after advancing cursor.
 	if err := wal.sendStandbyStatus(ctx); err != nil {
 		d.cfg.Logger.Warn("failed to send standby status after flush",
 			slog.String("error", err.Error()))
 	}
 
+	for _, row := range dlqRows {
+		_ = d.cfg.Statsd.Incr("jack.courier.dlq.write",
+			[]string{"job_type:" + row.jobType, "reason:" + row.reason}, 1)
+	}
+
 	_ = d.cfg.Statsd.Incr("jack.courier.flush.count", []string{"status:success"}, 1)
 	_ = d.cfg.Statsd.Distribution("jack.courier.flush.duration", time.Since(flushStart).Seconds(), nil, 1)
-	if failCount > 0 {
-		_ = d.cfg.Statsd.Distribution("jack.courier.flush.failed_jobs", float64(failCount), nil, 1)
+	if len(dlqRows) > 0 {
+		_ = d.cfg.Statsd.Distribution("jack.courier.flush.failed_jobs", float64(len(dlqRows)), nil, 1)
 	}
 
 	d.cfg.Logger.Info("batch submitted",
 		slog.Int("total", len(jobs)),
-		slog.Int("failed", failCount),
+		slog.Int("failed", len(dlqRows)),
 		slog.String("cursor_lsn", commitLSN.String()))
 
+	return nil
+}
+
+func (d *Driver) persistFlushResult(ctx context.Context, dlqRows []dlqRow, commitLSN lsn) error {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("pglg: begin flush tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := insertDLQRows(ctx, tx, d.cfg.dlqTable(), dlqRows); err != nil {
+		return err
+	}
+	if err := d.writeCursorTx(ctx, tx, commitLSN); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("pglg: commit flush tx: %w", err)
+	}
 	return nil
 }
