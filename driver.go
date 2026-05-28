@@ -458,7 +458,12 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 		slog.String("slot", d.cfg.SlotName),
 		slog.String("start_lsn", startLSN.String()))
 
-	// 4. Receive loop.
+	return d.processWALStream(ctx, wal, submit, startLSN)
+}
+
+// processWALStream runs the per-message receive loop against an already
+// started walConsumer. Returns when ctx is cancelled or any non recoverable error occurs.
+func (d *Driver) processWALStream(ctx context.Context, wal *walConsumer, submit courier.SubmitFunc, startLSN lsn) error {
 	var (
 		buf              txBuffer
 		pendingInserts   []parsedInsert
@@ -515,7 +520,11 @@ func (d *Driver) runOnce(ctx context.Context, submit courier.SubmitFunc) error {
 
 		msg, err := parseWALMessage(walData, inStream)
 		if err != nil {
-			return fmt.Errorf("pglg: parse WAL message at lsn %s: %w", wal.writePos(), err)
+			_ = d.cfg.Statsd.Incr("jack.courier.wal.parse.error", nil, 1)
+			d.cfg.Logger.Warn("failed to parse WAL message, skipping",
+				slog.String("error", err.Error()),
+				slog.String("lsn", wal.writePos().String()))
+			continue
 		}
 
 		switch ev := msg.(type) {

@@ -15,6 +15,13 @@ import (
 // lsn is a type alias for pglogrepl.LSN used throughout the driver.
 type lsn = pglogrepl.LSN
 
+// walCon is a minimal subset of *pgconn.PgConn so tests can inject a fake.
+// Production always holds a *pgconn.PgConn.
+type walConn interface {
+	ReceiveMessage(ctx context.Context) (pgproto3.BackendMessage, error)
+	Close(ctx context.Context) error
+}
+
 var (
 	errStandbyTimeout = errors.New("standby timeout")
 	errSlotBusy       = errors.New("pglg: replication slot in use by another consumer")
@@ -31,7 +38,7 @@ func mapStartReplicationError(err error) error {
 
 // walConsumer manages a logical replication connection to PostgreSQL.
 type walConsumer struct {
-	conn            *pgconn.PgConn
+	conn            walConn
 	slotName        string
 	publicationName string
 
@@ -77,11 +84,16 @@ func (w *walConsumer) connect(ctx context.Context, connString string) error {
 
 // startStreaming begins logical replication from the given LSN.
 func (w *walConsumer) startStreaming(ctx context.Context, startLSN lsn) error {
-	if _, err := pglogrepl.IdentifySystem(ctx, w.conn); err != nil {
+	pgConn, ok := w.conn.(*pgconn.PgConn)
+	if !ok { // this won't happen in production,
+		return fmt.Errorf("pglg: invalid connection type")
+	}
+
+	if _, err := pglogrepl.IdentifySystem(ctx, pgConn); err != nil {
 		return fmt.Errorf("pglg: identify system: %w", err)
 	}
 
-	err := pglogrepl.StartReplication(ctx, w.conn, w.slotName, startLSN,
+	err := pglogrepl.StartReplication(ctx, pgConn, w.slotName, startLSN,
 		pglogrepl.StartReplicationOptions{
 			PluginArgs: []string{
 				"proto_version '2'",
@@ -154,7 +166,7 @@ func (w *walConsumer) sendStandbyStatus(ctx context.Context) error {
 	// if the parent context is being cancelled during shutdown.
 	statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancel()
-	return pglogrepl.SendStandbyStatusUpdate(statusCtx, w.conn, w.standbyStatusUpdate(time.Now().UTC()))
+	return pglogrepl.SendStandbyStatusUpdate(statusCtx, w.conn.(*pgconn.PgConn), w.standbyStatusUpdate(time.Now().UTC()))
 }
 
 func (w *walConsumer) standbyStatusUpdate(now time.Time) pglogrepl.StandbyStatusUpdate {
