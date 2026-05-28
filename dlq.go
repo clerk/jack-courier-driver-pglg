@@ -149,7 +149,7 @@ func (d *Driver) dlqCleanup(ctx context.Context) {
 func (d *Driver) runDLQCleanup(ctx context.Context) {
 	start := time.Now()
 	query := fmt.Sprintf(
-		"DELETE FROM %s WHERE dead_lettered_at < now() - $1",
+		"DELETE FROM %s WHERE dead_lettered_at < now() - $1::interval",
 		d.cfg.dlqTable(),
 	)
 	interval := pgtype.Interval{
