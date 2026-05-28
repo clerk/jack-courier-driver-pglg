@@ -1071,3 +1071,157 @@ func TestIntegration_RejectedRow_StoredInDLQ(t *testing.T) {
 
 	awaitClean(t, cancel, runErr)
 }
+
+// A transaction open on the publisher during idle driver time commits
+// cleanly: the row is delivered exactly once and not delivered again after a restart
+func TestIntegration_OpenPublisherTxDoesNotCorruptDelivery(t *testing.T) {
+	env := newIntegrationEnv(t)
+	d := env.newDriver(t)
+	d.cfg.StandbyInterval = 200 * time.Millisecond
+	d.cfg.BatchTimeout = 100 * time.Millisecond
+
+	submitted := make(chan []courier.Job, 4)
+	submit := func(_ context.Context, jobs []courier.Job) ([]courier.SubmitResult, error) {
+		submitted <- jobs
+		results := make([]courier.SubmitResult, len(jobs))
+		for i, j := range jobs {
+			results[i] = courier.SubmitResult{CorrelationID: j.CorrelationID, JobID: "ok"}
+		}
+		return results, nil
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	runErr := make(chan error, 1)
+	go func() { runErr <- d.Run(ctx, submit) }()
+
+	// Open a transaction on a separate connection and insert a row without
+	// committing. From the publisher's point of view this row exists in WAL
+	// but is not yet visible to logical decoding.
+	// Open a tx on a separate conn and insert a row but not commit.
+	// This simulates the scenario:
+	// 1. Driver is idle, waiting for new rows.
+	// 2. An external tx inserts a row but does not commit yet. The driver's
+	//    replication connection receives keepalives with an advanced
+	//	ServerWALEnd that is past the open tx's insert LSN.
+	// 3. The external tx commits. The driver should deliver the new row, even
+	//    though its clientXLogPos is already past the insert LSN, because postgres
+	//    slot should be holding restart_lsn back until the commit.
+	tx, err := env.pool.Begin(t.Context())
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(t.Context()) }()
+
+	_, err = tx.Exec(t.Context(), fmt.Sprintf(`
+		INSERT INTO %s.%s_jobs (producer_id, job_type, payload, run_at, trace_id, shadow)
+		VALUES ($1, $2, $3, NOW(), $4, $5)
+	`, env.schema, env.prefix), "producer-open", "open-tx", []byte(`{"open":true}`), "trace-open", false)
+	require.NoError(t, err)
+
+	// generate some wal here so the publisher sends keepalives withi a serverWalEnd past the open transaction insert
+	_, err = env.pool.Exec(t.Context(), "CREATE TABLE IF NOT EXISTS pglg_open_noise (id BIGSERIAL PRIMARY KEY)")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, _ = env.pool.Exec(context.Background(), "DROP TABLE IF EXISTS pglg_open_noise")
+	})
+	for i := 0; i < 5; i++ {
+		_, err = env.pool.Exec(t.Context(), "INSERT INTO pglg_open_noise DEFAULT VALUES")
+		require.NoError(t, err)
+	}
+
+	// we have to wait for one idle flush window to bump the confirmed_flush_lsn
+	time.Sleep(1 * time.Second)
+
+	// there restart_lsn should be behind the open tx's insert, and the confirmed_flush_lsn can be past it
+	var confirmedLSN, restartLSN string
+	require.NoError(t, env.pool.QueryRow(t.Context(), `
+		SELECT confirmed_flush_lsn::text, restart_lsn::text
+		FROM pg_replication_slots WHERE slot_name = $1
+	`, env.slot).Scan(&confirmedLSN, &restartLSN))
+	t.Logf("during open tx: confirmed_flush_lsn=%s restart_lsn=%s", confirmedLSN, restartLSN)
+
+	// Snapshot the cursor before commit so we can wait for it to change after
+	// delivery (avoids racing cancel against persistFlushResult's tx.Commit).
+	var cursorBefore string
+	_ = env.pool.QueryRow(t.Context(), fmt.Sprintf(
+		"SELECT COALESCE(last_lsn::text, '0/0') FROM %s.%s_cursor WHERE slot_name = $1",
+		env.schema, env.prefix,
+	), env.slot).Scan(&cursorBefore)
+
+	// we shoulld see the row from the open tx get delivered after the commet,
+	// even though the confirmed_flush_lsn is past its insert LSN,
+	// because the slot restart_lsn should be before the insert until the commit happens
+	require.NoError(t, tx.Commit(t.Context()))
+
+	select {
+	case batch := <-submitted:
+		require.Len(t, batch, 1, "open-tx row should be delivered exactly once")
+		assert.Equal(t, "trace-open", batch[0].TraceID)
+		assert.Equal(t, []byte(`{"open":true}`), batch[0].Payload)
+	case <-time.After(10 * time.Second):
+		t.Fatal("row from previously-open tx was never delivered")
+	}
+
+	// wait to commit
+	require.Eventually(t, func() bool {
+		var cursorNow string
+		err := env.pool.QueryRow(t.Context(), fmt.Sprintf(
+			"SELECT COALESCE(last_lsn::text, '0/0') FROM %s.%s_cursor WHERE slot_name = $1",
+			env.schema, env.prefix,
+		), env.slot).Scan(&cursorNow)
+		return err == nil && cursorNow != cursorBefore && cursorNow != "0/0"
+	}, 5*time.Second, 50*time.Millisecond, "cursor did not advance after open-tx delivery")
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("driver 1 returned unexpected error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("driver 1 did not exit after cancel")
+	}
+	require.Eventually(t, func() bool {
+		var active bool
+		err := env.pool.QueryRow(t.Context(),
+			`SELECT active FROM pg_replication_slots WHERE slot_name = $1`,
+			env.slot,
+		).Scan(&active)
+		return err == nil && !active
+	}, 5*time.Second, 20*time.Millisecond, "slot still active after driver 1 exit")
+
+	// the new driver must not re deliver the previous open transaction
+	d2 := env.newDriver(t)
+	submitted2 := make(chan []courier.Job, 4)
+	submit2 := func(_ context.Context, jobs []courier.Job) ([]courier.SubmitResult, error) {
+		submitted2 <- jobs
+		results := make([]courier.SubmitResult, len(jobs))
+		for i, j := range jobs {
+			results[i] = courier.SubmitResult{CorrelationID: j.CorrelationID, JobID: "ok"}
+		}
+		return results, nil
+	}
+
+	ctx2, cancel2 := context.WithCancel(t.Context())
+	defer cancel2()
+	runErr2 := make(chan error, 1)
+	go func() { runErr2 <- d2.Run(ctx2, submit2) }()
+
+	env.insertJob(t, "producer-after", "after-restart", "trace-after", []byte(`{"i":2}`), false)
+
+	select {
+	case batch := <-submitted2:
+		require.Len(t, batch, 1, "driver 2 should deliver only the new row")
+		assert.Equal(t, "trace-after", batch[0].TraceID,
+			"driver 2 must NOT re-deliver the previously-open-tx row")
+	case <-time.After(10 * time.Second):
+		t.Fatal("driver 2 did not deliver the post-restart row")
+	}
+
+	select {
+	case extra := <-submitted2:
+		t.Fatalf("unexpected extra delivery from driver 2: %+v", extra)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	awaitClean(t, cancel2, runErr2)
+}
