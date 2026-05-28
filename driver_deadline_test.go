@@ -46,7 +46,7 @@ func TestCanAdvanceIdleFlush(t *testing.T) {
 		{
 			name: "false when the current transaction has buffered rows",
 			buf: txBuffer{
-				inserts: []bufferedInsert{{row: parsedInsert{id: 1}}},
+				inserts: []parsedInsert{{id: 1}},
 			},
 			want: false,
 		},

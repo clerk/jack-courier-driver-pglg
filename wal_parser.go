@@ -21,7 +21,6 @@ type walRelation struct {
 type walInsert struct {
 	relationID uint32
 	values     []columnValue
-	xid        uint32
 }
 
 type columnValue struct {
@@ -35,23 +34,11 @@ type walCommit struct {
 
 type walBegin struct{}
 
-type (
-	walStreamStart struct{}
-	walStreamStop  struct{}
-)
-
-type walStreamCommit struct {
-	commitLSN lsn
-}
-
-type walStreamAbort struct {
-	xid    uint32
-	subXid uint32
-}
-
 // parseWALMessage parses a raw pgoutput v2 WAL message into an internal type.
-func parseWALMessage(walData []byte, inStream bool) (any, error) {
-	msg, err := pglogrepl.ParseV2(walData, inStream)
+// The driver does not negotiate streaming, so pgoutput never emits stream
+// messages and we don't decode them.
+func parseWALMessage(walData []byte) (any, error) {
+	msg, err := pglogrepl.ParseV2(walData, false)
 	if err != nil {
 		return nil, fmt.Errorf("pglg: parse WAL message: %w", err)
 	}
@@ -79,7 +66,7 @@ func parseWALMessage(walData []byte, inStream bool) (any, error) {
 				data:   string(col.Data),
 			}
 		}
-		return &walInsert{relationID: m.RelationID, values: vals, xid: m.Xid}, nil
+		return &walInsert{relationID: m.RelationID, values: vals}, nil
 
 	case *pglogrepl.CommitMessage:
 		return &walCommit{commitLSN: m.TransactionEndLSN}, nil
@@ -87,17 +74,11 @@ func parseWALMessage(walData []byte, inStream bool) (any, error) {
 	case *pglogrepl.BeginMessage:
 		return &walBegin{}, nil
 
-	case *pglogrepl.StreamStartMessageV2:
-		return &walStreamStart{}, nil
-
-	case *pglogrepl.StreamStopMessageV2:
-		return &walStreamStop{}, nil
-
-	case *pglogrepl.StreamCommitMessageV2:
-		return &walStreamCommit{commitLSN: m.TransactionEndLSN}, nil
-
-	case *pglogrepl.StreamAbortMessageV2:
-		return &walStreamAbort{xid: m.Xid, subXid: m.SubXid}, nil
+	case *pglogrepl.StreamStartMessageV2,
+		*pglogrepl.StreamStopMessageV2,
+		*pglogrepl.StreamCommitMessageV2,
+		*pglogrepl.StreamAbortMessageV2:
+		return nil, fmt.Errorf("pglg: received streaming WAL message %T but the driver does not negotiate streaming: check StartReplication PluginArgs", m)
 
 	default:
 		return nil, nil // ignore unhandled message types
@@ -212,12 +193,7 @@ func parseTimestamp(s string) (time.Time, error) {
 
 // txBuffer accumulates parsed inserts within a single WAL transaction.
 type txBuffer struct {
-	inserts []bufferedInsert
-}
-
-type bufferedInsert struct {
-	row parsedInsert
-	xid uint32
+	inserts []parsedInsert
 }
 
 func (tb *txBuffer) reset() {
@@ -228,16 +204,6 @@ func (tb *txBuffer) empty() bool {
 	return len(tb.inserts) == 0
 }
 
-func (tb *txBuffer) addInsert(p parsedInsert, xid uint32) {
-	tb.inserts = append(tb.inserts, bufferedInsert{row: p, xid: xid})
-}
-
-func (tb *txBuffer) removeXID(xid uint32) {
-	kept := tb.inserts[:0]
-	for _, ins := range tb.inserts {
-		if ins.xid != xid {
-			kept = append(kept, ins)
-		}
-	}
-	tb.inserts = kept
+func (tb *txBuffer) addInsert(p parsedInsert) {
+	tb.inserts = append(tb.inserts, p)
 }

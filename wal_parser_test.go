@@ -164,46 +164,10 @@ func TestParseWALMessageBegin(t *testing.T) {
 	binary.BigEndian.PutUint64(msg[9:], 0)
 	binary.BigEndian.PutUint32(msg[17:], 123)
 
-	got, err := parseWALMessage(msg, false)
+	got, err := parseWALMessage(msg)
 
 	require.NoError(t, err)
 	assert.IsType(t, &walBegin{}, got)
-}
-
-func TestParseWALMessageStreamInsertIncludesXID(t *testing.T) {
-	msg := make([]byte, 1+4+4+1+2+1+4+2)
-	msg[0] = 'I'
-	binary.BigEndian.PutUint32(msg[1:], 77)
-	binary.BigEndian.PutUint32(msg[5:], 1234)
-	msg[9] = 'N'
-	binary.BigEndian.PutUint16(msg[10:], 1)
-	msg[12] = 't'
-	binary.BigEndian.PutUint32(msg[13:], 2)
-	copy(msg[17:], "42")
-
-	got, err := parseWALMessage(msg, true)
-
-	require.NoError(t, err)
-	require.IsType(t, &walInsert{}, got)
-	insert := got.(*walInsert)
-	assert.Equal(t, uint32(77), insert.xid)
-	assert.Equal(t, uint32(1234), insert.relationID)
-	assert.Equal(t, []columnValue{{data: "42"}}, insert.values)
-}
-
-func TestParseWALMessageStreamAbortIncludesXIDs(t *testing.T) {
-	msg := make([]byte, 1+4+4)
-	msg[0] = 'A'
-	binary.BigEndian.PutUint32(msg[1:], 10)
-	binary.BigEndian.PutUint32(msg[5:], 20)
-
-	got, err := parseWALMessage(msg, false)
-
-	require.NoError(t, err)
-	require.IsType(t, &walStreamAbort{}, got)
-	abort := got.(*walStreamAbort)
-	assert.Equal(t, uint32(10), abort.xid)
-	assert.Equal(t, uint32(20), abort.subXid)
 }
 
 func TestParseTimestamp(t *testing.T) {
@@ -257,8 +221,8 @@ func TestParseTimestamp_Invalid(t *testing.T) {
 func TestTxBuffer(t *testing.T) {
 	var buf txBuffer
 
-	buf.addInsert(parsedInsert{id: 1, jobType: "a"}, 0)
-	buf.addInsert(parsedInsert{id: 2, jobType: "b"}, 0)
+	buf.addInsert(parsedInsert{id: 1, jobType: "a"})
+	buf.addInsert(parsedInsert{id: 2, jobType: "b"})
 
 	if len(buf.inserts) != 2 {
 		t.Fatalf("expected 2 inserts, got %d", len(buf.inserts))
@@ -271,21 +235,8 @@ func TestTxBuffer(t *testing.T) {
 	}
 
 	// Ensure the underlying slice is reused (no allocation).
-	buf.addInsert(parsedInsert{id: 3, jobType: "c"}, 0)
+	buf.addInsert(parsedInsert{id: 3, jobType: "c"})
 	if len(buf.inserts) != 1 {
 		t.Fatalf("expected 1 insert after re-add, got %d", len(buf.inserts))
 	}
-}
-
-func TestTxBufferRemoveXIDRemovesOnlyAbortedSubtransactionRows(t *testing.T) {
-	var buf txBuffer
-	buf.addInsert(parsedInsert{id: 1, jobType: "outer"}, 100)
-	buf.addInsert(parsedInsert{id: 2, jobType: "sub"}, 200)
-	buf.addInsert(parsedInsert{id: 3, jobType: "outer-later"}, 100)
-
-	buf.removeXID(200)
-
-	require.Len(t, buf.inserts, 2)
-	assert.Equal(t, int64(1), buf.inserts[0].row.id)
-	assert.Equal(t, int64(3), buf.inserts[1].row.id)
 }

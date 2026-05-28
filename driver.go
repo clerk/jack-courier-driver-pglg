@@ -468,7 +468,6 @@ func (d *Driver) processWALStream(ctx context.Context, wal *walConsumer, submit 
 		buf              txBuffer
 		pendingInserts   []parsedInsert
 		pendingCommitLSN = startLSN
-		inStream         bool
 		inTx             bool
 	)
 
@@ -518,7 +517,7 @@ func (d *Driver) processWALStream(ctx context.Context, wal *walConsumer, submit 
 			continue
 		}
 
-		msg, err := parseWALMessage(walData, inStream)
+		msg, err := parseWALMessage(walData)
 		if err != nil {
 			_ = d.cfg.Statsd.Incr("jack.courier.wal.parse.error", nil, 1)
 			d.cfg.Logger.Warn("failed to parse WAL message, skipping",
@@ -540,13 +539,13 @@ func (d *Driver) processWALStream(ctx context.Context, wal *walConsumer, submit 
 				continue
 			}
 			if job != nil {
-				buf.addInsert(*job, ev.xid)
+				buf.addInsert(*job)
 			}
 		case *walCommit:
 			wasPendingEmpty := len(pendingInserts) == 0
 			for i := range buf.inserts {
-				d.recordRowAge(&buf.inserts[i].row)
-				pendingInserts = append(pendingInserts, buf.inserts[i].row)
+				d.recordRowAge(&buf.inserts[i])
+				pendingInserts = append(pendingInserts, buf.inserts[i])
 			}
 			if ev.commitLSN > pendingCommitLSN {
 				pendingCommitLSN = ev.commitLSN
@@ -563,34 +562,6 @@ func (d *Driver) processWALStream(ctx context.Context, wal *walConsumer, submit 
 				}
 				pendingInserts = pendingInserts[:0]
 				nextBatchAt = time.Time{}
-			}
-		// the driver does not support streaming transactions
-		// the above cases won't be reached, but we keep here in case we need to add support in the future
-		case *walStreamStart:
-			inStream = true
-			inTx = true
-		case *walStreamStop:
-			inStream = false
-		case *walStreamCommit:
-			wasPendingEmpty := len(pendingInserts) == 0
-			for i := range buf.inserts {
-				d.recordRowAge(&buf.inserts[i].row)
-				pendingInserts = append(pendingInserts, buf.inserts[i].row)
-			}
-			if ev.commitLSN > pendingCommitLSN {
-				pendingCommitLSN = ev.commitLSN
-			}
-			buf.reset()
-			inTx = false
-			if wasPendingEmpty && len(pendingInserts) > 0 {
-				nextBatchAt = time.Now().Add(d.cfg.BatchTimeout)
-			}
-		case *walStreamAbort:
-			if ev.xid == ev.subXid {
-				buf.reset()
-				inTx = false
-			} else {
-				buf.removeXID(ev.subXid)
 			}
 		}
 	}
