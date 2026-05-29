@@ -146,4 +146,31 @@ integration: ## Run integration tests against the local Postgres (run `make up` 
 	PGLG_INTEGRATION_SLOT="$(INTEGRATION_SLOT)" \
 		go test -tags=integration -count=1 -race -v -run '^TestIntegration_' ./...
 
-.PHONY: up down integration
+BENCH_PREFIX=bench
+BENCH_PUBLICATION=bench_pub
+BENCH_SLOT=bench_slot
+BENCH_RATE?=2000
+BENCH_DURATION?=60s
+BENCH_SUBMIT_LATENCY?=0
+BENCH_PAYLOAD_SIZE?=256
+
+bench: ## Run the local steady-state WAL-lag benchmark (brings up Postgres, provisions a bench schema)
+	docker compose up -d --wait
+	go run ./cmd/pglg-setup create \
+		--conn-string="$(INTEGRATION_CONN_STRING)" \
+		--schema=$(INTEGRATION_SCHEMA) \
+		--prefix=$(BENCH_PREFIX) \
+		--publication=$(BENCH_PUBLICATION) \
+		--slot=$(BENCH_SLOT)
+	go run ./cmd/pglg-bench \
+		--conn-string="$(INTEGRATION_CONN_STRING)" \
+		--schema=$(INTEGRATION_SCHEMA) \
+		--prefix=$(BENCH_PREFIX) \
+		--publication=$(BENCH_PUBLICATION) \
+		--slot=$(BENCH_SLOT) \
+		--rate=$(BENCH_RATE) \
+		--duration=$(BENCH_DURATION) \
+		--submit-latency=$(BENCH_SUBMIT_LATENCY) \
+		--payload-size=$(BENCH_PAYLOAD_SIZE)
+
+.PHONY: up down integration bench

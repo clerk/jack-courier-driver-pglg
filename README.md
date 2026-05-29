@@ -212,3 +212,35 @@ Run `make up`
 Run `make integration`
 
 Run `make down` to cleanup db container
+
+## Benchmark
+
+`cmd/pglg-bench` checks whether the replication slot's WAL lag stays bounded
+under sustained load. It runs against the same local Postgres as the
+integration tests, using a `bench`-prefixed schema and an in-process submit stub
+(no jack-service).
+
+```bash
+make bench
+```
+
+Override defaults via environment variables:
+
+```bash
+make bench BENCH_RATE=4000 BENCH_DURATION=30s BENCH_SUBMIT_LATENCY=5ms
+```
+
+### Output
+
+Inserts at `BENCH_RATE` for `BENCH_DURATION` while the driver drains, sampling slot lag every 100ms, then prints one line:
+
+```
+=== submit-latency=100ms ===
+@4000/s: rate 3999/s | lag p50 1.8MB p99 3.7MB max 3.8MB -> bounded ✓
+```
+
+- `rate 3999/s` — insert rate achieved; below `BENCH_RATE` means inserts couldn't keep up.
+- `lag p50/p99/max` — WAL retained by the slot (`current_wal - confirmed_flush_lsn`).
+- `bounded ✓` / `GROWING ✗` — bounded if final lag `<= 2 * median`: driver keeps pace, vs. retained WAL trending up without limit.
+
+Lag is the number that matters: it's WAL the primary can't reclaim until the driver catches up. Set `BENCH_RATE` near your real job rate — `bounded ✓` with small lag means headroom; raise it until lag grows to find the ceiling. Local numbers are optimistic.
