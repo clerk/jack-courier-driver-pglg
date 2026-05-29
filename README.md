@@ -204,3 +204,11 @@ The driver automatically manages partitions in a background goroutine:
 - Drops partitions older than 3 hours (configurable)
 - Runs every 5 minutes (configurable)
 - Errors are logged but don't crash the driver
+
+## Integration Tests
+
+Run `make up` 
+
+Run `make integration`
+
+Run `make down` to cleanup db container

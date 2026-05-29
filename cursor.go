@@ -35,10 +35,11 @@ func (d *Driver) readCursor(ctx context.Context) (lsn, error) {
 
 func (d *Driver) writeCursorTx(ctx context.Context, tx pgx.Tx, l lsn) error {
 	query := fmt.Sprintf(`
-		INSERT INTO %s (slot_name, last_lsn, updated_at)
+		INSERT INTO %[1]s (slot_name, last_lsn, updated_at)
 		VALUES ($1, $2::pg_lsn, now())
 		ON CONFLICT (slot_name)
 		DO UPDATE SET last_lsn = EXCLUDED.last_lsn, updated_at = now()
+		WHERE EXCLUDED.last_lsn > %[1]s.last_lsn
 	`, d.cfg.cursorTable())
 
 	if _, err := tx.Exec(ctx, query, d.cfg.SlotName, pglogrepl.LSN(l).String()); err != nil {

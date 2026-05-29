@@ -113,3 +113,37 @@ db/destroy/production: ## Drop outbox tables, publication, and replication slot 
 		--slot=$(PRODUCTION_SLOT)
 
 .PHONY: db/connect/staging db/connect/production db/setup/staging db/setup/production db/destroy/staging db/destroy/production
+
+INTEGRATION_DB_USER=pglg
+INTEGRATION_DB_PASS=pglg
+INTEGRATION_DB_NAME=pglg
+INTEGRATION_DB_HOST=127.0.0.1
+INTEGRATION_DB_PORT=15434
+INTEGRATION_CONN_STRING=host=$(INTEGRATION_DB_HOST) port=$(INTEGRATION_DB_PORT) user=$(INTEGRATION_DB_USER) password=$(INTEGRATION_DB_PASS) dbname=$(INTEGRATION_DB_NAME) sslmode=disable
+
+INTEGRATION_SCHEMA=public
+INTEGRATION_PREFIX=outbox
+INTEGRATION_PUBLICATION=outbox_pub
+INTEGRATION_SLOT=outbox_slot
+
+up: ## Bring up local Postgres and provision the pglg schema
+	docker compose up -d --wait
+	go run ./cmd/pglg-setup create \
+		--conn-string="$(INTEGRATION_CONN_STRING)" \
+		--schema=$(INTEGRATION_SCHEMA) \
+		--prefix=$(INTEGRATION_PREFIX) \
+		--publication=$(INTEGRATION_PUBLICATION) \
+		--slot=$(INTEGRATION_SLOT)
+
+down: ## Stop and remove the local Postgres container
+	docker compose down -v
+
+integration: ## Run integration tests against the local Postgres (run `make up` first)
+	PGLG_INTEGRATION_CONN_STRING="$(INTEGRATION_CONN_STRING)" \
+	PGLG_INTEGRATION_SCHEMA="$(INTEGRATION_SCHEMA)" \
+	PGLG_INTEGRATION_PREFIX="$(INTEGRATION_PREFIX)" \
+	PGLG_INTEGRATION_PUBLICATION="$(INTEGRATION_PUBLICATION)" \
+	PGLG_INTEGRATION_SLOT="$(INTEGRATION_SLOT)" \
+		go test -tags=integration -count=1 -race -v -run '^TestIntegration_' ./...
+
+.PHONY: up down integration

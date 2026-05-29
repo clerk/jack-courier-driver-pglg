@@ -1,9 +1,13 @@
 package pglg
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func toBytea(s string) string {
@@ -151,6 +155,19 @@ func TestParsedInsertToJob(t *testing.T) {
 	if job.TraceID != "trace-xyz" {
 		t.Errorf("expected TraceID=trace-xyz, got %s", job.TraceID)
 	}
+}
+
+func TestParseWALMessageBegin(t *testing.T) {
+	msg := make([]byte, 1+8+8+4)
+	msg[0] = 'B'
+	binary.BigEndian.PutUint64(msg[1:], 0x10)
+	binary.BigEndian.PutUint64(msg[9:], 0)
+	binary.BigEndian.PutUint32(msg[17:], 123)
+
+	got, err := parseWALMessage(msg)
+
+	require.NoError(t, err)
+	assert.IsType(t, &walBegin{}, got)
 }
 
 func TestParseTimestamp(t *testing.T) {

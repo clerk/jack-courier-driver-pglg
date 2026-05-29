@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/jackc/pglogrepl"
 	courier "github.com/clerk/jack-courier-lib"
+	"github.com/jackc/pglogrepl"
 )
 
 // WAL message types used as internal representations after parsing.
@@ -32,18 +32,13 @@ type walCommit struct {
 	commitLSN lsn
 }
 
-type walStreamStart struct{}
-type walStreamStop struct{}
-
-type walStreamCommit struct {
-	commitLSN lsn
-}
-
-type walStreamAbort struct{}
+type walBegin struct{}
 
 // parseWALMessage parses a raw pgoutput v2 WAL message into an internal type.
-func parseWALMessage(walData []byte, inStream bool) (any, error) {
-	msg, err := pglogrepl.ParseV2(walData, inStream)
+// The driver does not negotiate streaming, so pgoutput never emits stream
+// messages and we don't decode them.
+func parseWALMessage(walData []byte) (any, error) {
+	msg, err := pglogrepl.ParseV2(walData, false)
 	if err != nil {
 		return nil, fmt.Errorf("pglg: parse WAL message: %w", err)
 	}
@@ -77,19 +72,13 @@ func parseWALMessage(walData []byte, inStream bool) (any, error) {
 		return &walCommit{commitLSN: m.TransactionEndLSN}, nil
 
 	case *pglogrepl.BeginMessage:
-		return nil, nil // no-op, we don't need begin markers
+		return &walBegin{}, nil
 
-	case *pglogrepl.StreamStartMessageV2:
-		return &walStreamStart{}, nil
-
-	case *pglogrepl.StreamStopMessageV2:
-		return &walStreamStop{}, nil
-
-	case *pglogrepl.StreamCommitMessageV2:
-		return &walStreamCommit{commitLSN: m.TransactionEndLSN}, nil
-
-	case *pglogrepl.StreamAbortMessageV2:
-		return &walStreamAbort{}, nil
+	case *pglogrepl.StreamStartMessageV2,
+		*pglogrepl.StreamStopMessageV2,
+		*pglogrepl.StreamCommitMessageV2,
+		*pglogrepl.StreamAbortMessageV2:
+		return nil, fmt.Errorf("pglg: received streaming WAL message %T but the driver does not negotiate streaming: check StartReplication PluginArgs", m)
 
 	default:
 		return nil, nil // ignore unhandled message types
@@ -209,6 +198,10 @@ type txBuffer struct {
 
 func (tb *txBuffer) reset() {
 	tb.inserts = tb.inserts[:0]
+}
+
+func (tb *txBuffer) empty() bool {
+	return len(tb.inserts) == 0
 }
 
 func (tb *txBuffer) addInsert(p parsedInsert) {

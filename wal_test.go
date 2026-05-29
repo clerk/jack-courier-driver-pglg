@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 )
@@ -41,4 +43,48 @@ func TestMapStartReplicationError(t *testing.T) {
 		assert.Contains(t, got.Error(), "pglg: start replication")
 		assert.ErrorIs(t, got, in)
 	})
+}
+
+func TestStandbyStatusUpdateReportsSafeFlushLSN(t *testing.T) {
+	wal := &walConsumer{
+		clientXLogPos: lsn(0x300),
+		flushLSN:      lsn(0x100),
+	}
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+
+	got := wal.standbyStatusUpdate(now)
+
+	assert.Equal(t, pglogrepl.LSN(0x300), got.WALWritePosition)
+	assert.Equal(t, pglogrepl.LSN(0x100), got.WALFlushPosition)
+	assert.Equal(t, pglogrepl.LSN(0x100), got.WALApplyPosition)
+	assert.Equal(t, now, got.ClientTime)
+}
+
+func TestStandbyStatusUpdateDoesNotAdvanceFlushLSNFromZero(t *testing.T) {
+	wal := &walConsumer{
+		clientXLogPos: lsn(0x300),
+	}
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+
+	got := wal.standbyStatusUpdate(now)
+
+	assert.Equal(t, pglogrepl.LSN(0), got.WALWritePosition)
+	assert.Equal(t, pglogrepl.LSN(0), got.WALFlushPosition)
+	assert.Equal(t, pglogrepl.LSN(0), got.WALApplyPosition)
+	assert.Equal(t, now, got.ClientTime)
+}
+
+func TestStandbyStatusUpdateWriteLSNIsAtLeastFlushLSN(t *testing.T) {
+	wal := &walConsumer{
+		clientXLogPos: lsn(0x100),
+		flushLSN:      lsn(0x300),
+	}
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+
+	got := wal.standbyStatusUpdate(now)
+
+	assert.Equal(t, pglogrepl.LSN(0x300), got.WALWritePosition)
+	assert.Equal(t, pglogrepl.LSN(0x300), got.WALFlushPosition)
+	assert.Equal(t, pglogrepl.LSN(0x300), got.WALApplyPosition)
+	assert.Equal(t, now, got.ClientTime)
 }
